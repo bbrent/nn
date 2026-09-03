@@ -99,10 +99,14 @@
       ? bowls.reduce((sum, b) => sum + b.r * 2, 0) / bowls.length
       : medianR * 2;
 
-    const ranking = bowls.map(b => ({
-      bowl: b,
-      dist: jack ? Math.hypot(b.x - jack.x, b.y - jack.y) / avgBowlDiameter : null,
-    }));
+    // localX/localY: jack-centered position in bowl-diameter units — the frame's
+    // own orientation and origin, not tied to pixels. This is what cross-frame
+    // fusion aligns between frames (see fusion.js); dist is just its magnitude.
+    const ranking = bowls.map(b => {
+      const localX = jack ? (b.x - jack.x) / avgBowlDiameter : null;
+      const localY = jack ? (b.y - jack.y) / avgBowlDiameter : null;
+      return { bowl: b, dist: jack ? Math.hypot(localX, localY) : null, localX, localY };
+    });
     if (jack) ranking.sort((a, b) => a.dist - b.dist);
 
     let usable = true;
@@ -127,33 +131,51 @@
     return { detections, ...classifyAndRank(detections) };
   }
 
+  // Detection has a real noise floor (circle-center jitter, jack-position
+  // jitter feeding into every distance) — two bowls whose distances differ by
+  // less than this, in bowl-diameter units, aren't reliably orderable. This
+  // is a rough starting estimate pending real-photo data; see
+  // test/fixtures/real/.
+  const TIE_EPSILON = 0.15;
+
   // Real lawn bowls scoring: a team's score is how many of its bowls sit
   // closer to the jack than the other team's closest bowl. Since assignments
-  // is parallel to a ranking already sorted closest-first, that's just the
-  // leading run of same-team entries — camera can't reliably read faded
-  // markings, so a human assigns team membership by tapping, closest bowl
-  // first, and can stop as soon as the other team's first bowl shows up.
-  function computeScore(assignments) {
+  // is parallel to ranking (already sorted closest-first, ranking[i].dist in
+  // bowl-diameter units), the score is the leading run of same-team entries
+  // — camera can't reliably read faded markings, so a human assigns team
+  // membership by tapping, closest bowl first, and can stop as soon as the
+  // other team's first bowl shows up.
+  //
+  // The one boundary that can actually flip the reported score is between
+  // the last counted bowl and the first opposing one — if those two are
+  // within TIE_EPSILON of each other, the true order isn't something this
+  // measurement can resolve, so the result is flagged tooClose rather than
+  // stated as certain.
+  function computeScore(ranking, assignments, epsilon) {
+    if (epsilon === undefined) epsilon = TIE_EPSILON;
+
     if (assignments.length === 0) {
-      return { team: null, count: 0, pending: false };
+      return { team: null, count: 0, pending: false, tooClose: false };
     }
 
     const leadTeam = assignments[0];
     if (!leadTeam) {
-      return { team: null, count: 0, pending: true };
+      return { team: null, count: 0, pending: true, tooClose: false };
     }
 
     let count = 0;
-    for (const team of assignments) {
+    for (let i = 0; i < assignments.length; i++) {
+      const team = assignments[i];
       if (team === leadTeam) {
         count++;
       } else if (team === null) {
-        return { team: leadTeam, count, pending: true };
+        return { team: leadTeam, count, pending: true, tooClose: false };
       } else {
-        break;
+        const gap = ranking[i].dist - ranking[i - 1].dist;
+        return { team: leadTeam, count, pending: false, tooClose: gap < epsilon };
       }
     }
-    return { team: leadTeam, count, pending: false };
+    return { team: leadTeam, count, pending: false, tooClose: false };
   }
 
   return {
@@ -161,6 +183,7 @@
     JACK_RADIUS_RATIO,
     CONFIDENT_JACK_WORK_RADIUS_PX,
     JACK_TO_NEAREST_BOWL_RATIO,
+    TIE_EPSILON,
     detectCircles,
     classifyAndRank,
     detectAndRank,

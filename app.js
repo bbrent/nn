@@ -1,14 +1,13 @@
-// Milestone 1: single-frame circle detection + relative distance to jack.
-// Detection logic lives in detection.js (shared with the Node test harness).
-// Cross-frame fusion (panning the phone over the whole rink) comes next.
+// Detection logic lives in detection.js, cross-frame fusion in fusion.js
+// (both shared with the Node test harness).
 
 let cvReady = false;
 let domReady = false;
 let scanning = false;
 let rafId = null;
 
-let lastResult = null; // most recent live detectAndRank() result, refreshed every frame
-let frozen = null; // { detections, jack, ranking } captured on Stop, for tap-to-assign
+let fusion = LawnBowlsFusion.createFusion(); // accumulated map, fed every usable frame while scanning
+let frozen = null; // { detections, jack, ranking } laid out from the fused map on Stop, for tap-to-assign
 let assignments = []; // parallel to frozen.ranking: 'mine' | 'theirs' | null
 
 let video, overlay, overlayCtx, statusEl, rankingEl, scanBtn;
@@ -72,27 +71,32 @@ function toggleScan() {
     scanning = false;
     if (rafId) cancelAnimationFrame(rafId);
     scanBtn.textContent = 'Start Scan';
+    video.pause();
 
-    // Freeze the last usable frame so bowls have stable positions to tap.
-    if (lastResult && lastResult.usable) {
-      frozen = lastResult;
+    // Lay out the fused map (not just the last frame) so bowls seen anywhere
+    // during the pan — even if out of frame now — have stable positions to tap.
+    const snapshot = LawnBowlsFusion.getSnapshot(fusion);
+    if (snapshot.bowls.length > 0) {
+      frozen = LawnBowlsFusion.layoutForCanvas(snapshot, overlay.width, overlay.height);
       assignments = new Array(frozen.ranking.length).fill(null);
-      setStatus('End frozen. Tap each flag, closest first, to mark it yours or theirs.');
+      setStatus(`Map built from ${fusion.frameCount} frame(s). Tap each flag, closest first, to mark it yours or theirs.`);
       renderFrozen();
     } else {
       frozen = null;
       assignments = [];
       overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
       rankingEl.innerHTML = '';
-      setStatus("Last frame wasn't reliable enough to score — rescan and stop on a clear view.");
+      setStatus('No usable frames were scanned — rescan and hold steady over the bowls.');
     }
   } else {
     scanning = true;
     frozen = null;
     assignments = [];
+    fusion = LawnBowlsFusion.createFusion();
     rankingEl.innerHTML = '';
     scanBtn.textContent = 'Stop Scan';
     setStatus('Scanning…');
+    video.play();
     rafId = requestAnimationFrame(processFrame);
   }
 }
@@ -103,10 +107,15 @@ function processFrame() {
   const src = cv.imread(video);
   const result = LawnBowlsDetection.detectAndRank(cv, src);
   src.delete();
-  lastResult = result;
+
+  if (result.usable) LawnBowlsFusion.addFrame(fusion, result);
 
   drawOverlay(result.detections, result.jack, result.usable ? result.ranking : []);
   renderRanking(result.ranking, result.usable, result.reason, result.detections.length);
+
+  const mapSnapshot = LawnBowlsFusion.getSnapshot(fusion);
+  const confirmedCount = mapSnapshot.ranking.filter(r => r.confirmed).length;
+  setStatus(`Scanning… ${mapSnapshot.bowls.length} bowl(s) tracked, ${confirmedCount} confirmed. Stop when ready.`);
 
   rafId = requestAnimationFrame(processFrame);
 }
@@ -212,7 +221,11 @@ const UNASSIGNED_FLAG_COLOR = '#616161';
 const ASSIGNMENT_CYCLE = [null, 'mine', 'theirs'];
 
 function renderFrozen() {
-  overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
+  // Fused positions aren't tied to whatever the camera currently sees (some
+  // bowls may be out of frame by now), so this is an abstract top-down map,
+  // not an overlay on the live picture — paint over the paused video feed.
+  overlayCtx.fillStyle = '#1b5e20';
+  overlayCtx.fillRect(0, 0, overlay.width, overlay.height);
 
   for (const d of frozen.detections) {
     const isJack = d === frozen.jack;
@@ -238,14 +251,18 @@ function renderScoreUI() {
   if (frozen.ranking.length === 0) {
     summary.textContent = 'No bowls to score (only the jack was detected).';
   } else {
-    const score = LawnBowlsDetection.computeScore(assignments);
+    const score = LawnBowlsDetection.computeScore(frozen.ranking, assignments);
     if (score.team === null) {
       summary.textContent = "Tap the closest bowl's flag to say whose it is.";
     } else {
       const label = score.team === 'mine' ? 'You' : 'Opponent';
-      summary.textContent = score.pending
-        ? `${label}: at least ${score.count} — keep tagging to confirm`
-        : `${label} score this end: ${score.count}`;
+      if (score.pending) {
+        summary.textContent = `${label}: at least ${score.count} — keep tagging to confirm`;
+      } else if (score.tooClose) {
+        summary.textContent = `${label}: ${score.count} — but the deciding bowls are too close to call from the scan, measure by hand`;
+      } else {
+        summary.textContent = `${label} score this end: ${score.count}`;
+      }
     }
   }
   rankingEl.appendChild(summary);

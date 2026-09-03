@@ -129,15 +129,17 @@ async function main() {
   let totalCount = 0;
   let failCount = 0;
 
-  const scoreResult = require('./score.test.js').run();
-  totalCount += scoreResult.total;
-  if (scoreResult.failures.length === 0) {
-    console.log(`PASS  computeScore (${scoreResult.total} cases)\n`);
-  } else {
-    failCount += scoreResult.failures.length;
-    console.log(`FAIL  computeScore`);
-    scoreResult.failures.forEach(f => console.log(`        - ${f}`));
-    console.log('');
+  for (const mod of ['./score.test.js', './fusion.test.js']) {
+    const result = require(mod).run();
+    totalCount += result.total;
+    if (result.failures.length === 0) {
+      console.log(`PASS  ${result.name} (${result.total} cases)\n`);
+    } else {
+      failCount += result.failures.length;
+      console.log(`FAIL  ${result.name}`);
+      result.failures.forEach(f => console.log(`        - ${f}`));
+      console.log('');
+    }
   }
 
   for (const { label, dir } of GROUND_TRUTH_DIRS) {
