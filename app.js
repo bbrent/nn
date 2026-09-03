@@ -1,6 +1,15 @@
 // Detection logic lives in detection.js, cross-frame fusion in fusion.js
 // (both shared with the Node test harness).
 
+// Surface any uncaught error on-screen instead of failing silently — this is
+// the only way to see what went wrong on a phone with no console attached.
+// Queries the DOM directly rather than the statusEl variable below, since
+// this must work even if the crash happened before that variable was set.
+window.addEventListener('error', e => {
+  const el = document.getElementById('status');
+  if (el) el.textContent = 'Script error: ' + e.message;
+});
+
 let cvReady = false;
 let domReady = false;
 let scanning = false;
@@ -104,18 +113,25 @@ function toggleScan() {
 function processFrame() {
   if (!scanning) return;
 
-  const src = cv.imread(video);
-  const result = LawnBowlsDetection.detectAndRank(cv, src);
-  src.delete();
+  try {
+    const src = cv.imread(video);
+    const result = LawnBowlsDetection.detectAndRank(cv, src);
+    src.delete();
 
-  if (result.usable) LawnBowlsFusion.addFrame(fusion, result);
+    if (result.usable) LawnBowlsFusion.addFrame(fusion, result);
 
-  drawOverlay(result.detections, result.jack, result.usable ? result.ranking : []);
-  renderRanking(result.ranking, result.usable, result.reason, result.detections.length);
+    drawOverlay(result.detections, result.jack, result.usable ? result.ranking : []);
+    renderRanking(result.ranking, result.usable, result.reason, result.detections.length);
 
-  const mapSnapshot = LawnBowlsFusion.getSnapshot(fusion);
-  const confirmedCount = mapSnapshot.ranking.filter(r => r.confirmed).length;
-  setStatus(`Scanning… ${mapSnapshot.bowls.length} bowl(s) tracked, ${confirmedCount} confirmed. Stop when ready.`);
+    const mapSnapshot = LawnBowlsFusion.getSnapshot(fusion);
+    const confirmedCount = mapSnapshot.ranking.filter(r => r.confirmed).length;
+    setStatus(`Scanning… ${mapSnapshot.bowls.length} bowl(s) tracked, ${confirmedCount} confirmed. Stop when ready.`);
+  } catch (err) {
+    scanning = false;
+    scanBtn.textContent = 'Start Scan';
+    setStatus('Scan error: ' + err.message);
+    return;
+  }
 
   rafId = requestAnimationFrame(processFrame);
 }
