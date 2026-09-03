@@ -1,14 +1,13 @@
 // Milestone 1: single-frame circle detection + relative distance to jack.
+// Detection logic lives in detection.js (shared with the Node test harness).
 // Cross-frame fusion (panning the phone over the whole rink) comes next.
-
-const WORK_WIDTH = 480; // downscaled width used for cv processing
 
 let cvReady = false;
 let domReady = false;
 let scanning = false;
 let rafId = null;
 
-let video, overlay, overlayCtx, workCanvas, workCtx, statusEl, rankingEl, scanBtn;
+let video, overlay, overlayCtx, statusEl, rankingEl, scanBtn;
 
 function onOpenCvReady() {
   cv['onRuntimeInitialized'] = () => {
@@ -21,14 +20,12 @@ document.addEventListener('DOMContentLoaded', () => {
   video = document.getElementById('video');
   overlay = document.getElementById('overlay');
   overlayCtx = overlay.getContext('2d');
-  workCanvas = document.createElement('canvas');
-  workCtx = workCanvas.getContext('2d', { willReadFrequently: true });
   statusEl = document.getElementById('status');
   rankingEl = document.getElementById('ranking');
   scanBtn = document.getElementById('scanBtn');
 
   scanBtn.addEventListener('click', toggleScan);
-  window.addEventListener('resize', sizeCanvases);
+  window.addEventListener('resize', sizeOverlay);
 
   domReady = true;
   maybeStart();
@@ -47,7 +44,7 @@ async function startCamera() {
     });
     video.srcObject = stream;
     await video.play();
-    sizeCanvases();
+    sizeOverlay();
     setStatus('Hold the phone over the rink and tap Start Scan.');
     scanBtn.disabled = false;
   } catch (err) {
@@ -55,13 +52,10 @@ async function startCamera() {
   }
 }
 
-function sizeCanvases() {
+function sizeOverlay() {
   if (!video.videoWidth) return;
   overlay.width = video.videoWidth;
   overlay.height = video.videoHeight;
-  const scale = WORK_WIDTH / video.videoWidth;
-  workCanvas.width = WORK_WIDTH;
-  workCanvas.height = Math.round(video.videoHeight * scale);
 }
 
 function setStatus(msg) {
@@ -82,106 +76,34 @@ function toggleScan() {
 function processFrame() {
   if (!scanning) return;
 
-  workCtx.drawImage(video, 0, 0, workCanvas.width, workCanvas.height);
-  const src = cv.imread(workCanvas);
-  const gray = new cv.Mat();
-  cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
-  cv.medianBlur(gray, gray, 5);
-
-  const circles = new cv.Mat();
-  cv.HoughCircles(
-    gray,
-    circles,
-    cv.HOUGH_GRADIENT,
-    1,
-    gray.rows / 12, // min distance between circle centers
-    100,            // Canny high threshold
-    30,             // accumulator threshold (lower = more false positives)
-    8,              // min radius, px at work resolution
-    60              // max radius, px at work resolution
-  );
-
-  const detections = [];
-  for (let i = 0; i < circles.cols; i++) {
-    detections.push({
-      x: circles.data32F[i * 3],
-      y: circles.data32F[i * 3 + 1],
-      r: circles.data32F[i * 3 + 2],
-    });
-  }
-
-  drawOverlay(detections);
-
+  const src = cv.imread(video);
+  const { detections, jack, ranking } = LawnBowlsDetection.detectAndRank(cv, src);
   src.delete();
-  gray.delete();
-  circles.delete();
+
+  drawOverlay(detections, jack);
+  renderRanking(ranking, jack !== null, detections.length);
 
   rafId = requestAnimationFrame(processFrame);
 }
 
-function drawOverlay(detections) {
-  const scaleX = overlay.width / workCanvas.width;
-  const scaleY = overlay.height / workCanvas.height;
+function drawOverlay(detections, jack) {
   overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
-
-  if (detections.length === 0) {
-    renderRanking([], false);
-    return;
-  }
-
-  // Jack is the ~2.5"-vs-4.6" outlier: markedly smaller than the median circle here.
-  const sortedR = [...detections].map(d => d.r).sort((a, b) => a - b);
-  const medianR = sortedR[Math.floor(sortedR.length / 2)];
-  const jackThreshold = medianR * 0.65;
-
-  let jack = null;
-  const bowls = [];
   for (const d of detections) {
-    if (d.r < jackThreshold) {
-      if (!jack || d.r < jack.r) {
-        if (jack) bowls.push(jack);
-        jack = d;
-      } else {
-        bowls.push(d);
-      }
-    } else {
-      bowls.push(d);
-    }
-  }
-
-  const avgBowlDiameter = bowls.length
-    ? bowls.reduce((sum, b) => sum + b.r * 2, 0) / bowls.length
-    : medianR * 2;
-
-  for (const d of detections) {
-    const isJack = d === jack;
-    const cx = d.x * scaleX;
-    const cy = d.y * scaleY;
-    const r = d.r * scaleX;
     overlayCtx.beginPath();
-    overlayCtx.arc(cx, cy, r, 0, 2 * Math.PI);
-    overlayCtx.strokeStyle = isJack ? '#ffd54f' : '#42a5f5';
+    overlayCtx.arc(d.x, d.y, d.r, 0, 2 * Math.PI);
+    overlayCtx.strokeStyle = d === jack ? '#ffd54f' : '#42a5f5';
     overlayCtx.lineWidth = 3;
     overlayCtx.stroke();
   }
-
-  const ranking = bowls.map(b => ({
-    bowl: b,
-    dist: jack ? Math.hypot(b.x - jack.x, b.y - jack.y) / avgBowlDiameter : null,
-  }));
-
-  if (jack) ranking.sort((a, b) => a.dist - b.dist);
-
-  renderRanking(ranking, jack !== null);
 }
 
-function renderRanking(ranking, haveJack) {
+function renderRanking(ranking, haveJack, detectionCount) {
   rankingEl.innerHTML = '';
 
   if (!haveJack) {
     const li = document.createElement('li');
-    li.textContent = ranking.length
-      ? `${ranking.length} circle(s) detected, no jack identified yet`
+    li.textContent = detectionCount
+      ? `${detectionCount} circle(s) detected, no jack identified yet`
       : 'No circles detected';
     rankingEl.appendChild(li);
     return;

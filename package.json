@@ -1,0 +1,25 @@
+{
+  "name": "nn",
+  "version": "1.0.0",
+  "description": "Lawn bowls scoring app: in-browser camera + opencv.js circle detection.",
+  "main": "app.js",
+  "scripts": {
+    "test": "node test/run.js",
+    "generate-fixtures": "node test/generate-fixtures.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bbrent/nn.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/bbrent/nn/issues"
+  },
+  "homepage": "https://github.com/bbrent/nn#readme",
+  "devDependencies": {
+    "@techstark/opencv-js": "^5.0.0-release.1",
+    "canvas": "^3.2.3"
+  }
+}
