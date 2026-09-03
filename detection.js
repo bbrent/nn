@@ -127,6 +127,35 @@
     return { detections, ...classifyAndRank(detections) };
   }
 
+  // Real lawn bowls scoring: a team's score is how many of its bowls sit
+  // closer to the jack than the other team's closest bowl. Since assignments
+  // is parallel to a ranking already sorted closest-first, that's just the
+  // leading run of same-team entries — camera can't reliably read faded
+  // markings, so a human assigns team membership by tapping, closest bowl
+  // first, and can stop as soon as the other team's first bowl shows up.
+  function computeScore(assignments) {
+    if (assignments.length === 0) {
+      return { team: null, count: 0, pending: false };
+    }
+
+    const leadTeam = assignments[0];
+    if (!leadTeam) {
+      return { team: null, count: 0, pending: true };
+    }
+
+    let count = 0;
+    for (const team of assignments) {
+      if (team === leadTeam) {
+        count++;
+      } else if (team === null) {
+        return { team: leadTeam, count, pending: true };
+      } else {
+        break;
+      }
+    }
+    return { team: leadTeam, count, pending: false };
+  }
+
   return {
     WORK_WIDTH,
     JACK_RADIUS_RATIO,
@@ -135,5 +164,6 @@
     detectCircles,
     classifyAndRank,
     detectAndRank,
+    computeScore,
   };
 });

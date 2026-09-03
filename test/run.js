@@ -129,6 +129,17 @@ async function main() {
   let totalCount = 0;
   let failCount = 0;
 
+  const scoreResult = require('./score.test.js').run();
+  totalCount += scoreResult.total;
+  if (scoreResult.failures.length === 0) {
+    console.log(`PASS  computeScore (${scoreResult.total} cases)\n`);
+  } else {
+    failCount += scoreResult.failures.length;
+    console.log(`FAIL  computeScore`);
+    scoreResult.failures.forEach(f => console.log(`        - ${f}`));
+    console.log('');
+  }
+
   for (const { label, dir } of GROUND_TRUTH_DIRS) {
     if (!fs.existsSync(dir)) continue;
     const sceneNames = fs

@@ -7,6 +7,10 @@ let domReady = false;
 let scanning = false;
 let rafId = null;
 
+let lastResult = null; // most recent live detectAndRank() result, refreshed every frame
+let frozen = null; // { detections, jack, ranking } captured on Stop, for tap-to-assign
+let assignments = []; // parallel to frozen.ranking: 'mine' | 'theirs' | null
+
 let video, overlay, overlayCtx, statusEl, rankingEl, scanBtn;
 
 function onOpenCvReady() {
@@ -25,6 +29,7 @@ document.addEventListener('DOMContentLoaded', () => {
   scanBtn = document.getElementById('scanBtn');
 
   scanBtn.addEventListener('click', toggleScan);
+  overlay.addEventListener('click', handleCanvasTap);
   window.addEventListener('resize', sizeOverlay);
 
   domReady = true;
@@ -63,13 +68,32 @@ function setStatus(msg) {
 }
 
 function toggleScan() {
-  scanning = !scanning;
-  scanBtn.textContent = scanning ? 'Stop Scan' : 'Start Scan';
   if (scanning) {
+    scanning = false;
+    if (rafId) cancelAnimationFrame(rafId);
+    scanBtn.textContent = 'Start Scan';
+
+    // Freeze the last usable frame so bowls have stable positions to tap.
+    if (lastResult && lastResult.usable) {
+      frozen = lastResult;
+      assignments = new Array(frozen.ranking.length).fill(null);
+      setStatus('End frozen. Tap each flag, closest first, to mark it yours or theirs.');
+      renderFrozen();
+    } else {
+      frozen = null;
+      assignments = [];
+      overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
+      rankingEl.innerHTML = '';
+      setStatus("Last frame wasn't reliable enough to score — rescan and stop on a clear view.");
+    }
+  } else {
+    scanning = true;
+    frozen = null;
+    assignments = [];
+    rankingEl.innerHTML = '';
+    scanBtn.textContent = 'Stop Scan';
+    setStatus('Scanning…');
     rafId = requestAnimationFrame(processFrame);
-  } else if (rafId) {
-    cancelAnimationFrame(rafId);
-    overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
   }
 }
 
@@ -77,11 +101,12 @@ function processFrame() {
   if (!scanning) return;
 
   const src = cv.imread(video);
-  const { detections, jack, ranking, usable, reason } = LawnBowlsDetection.detectAndRank(cv, src);
+  const result = LawnBowlsDetection.detectAndRank(cv, src);
   src.delete();
+  lastResult = result;
 
-  drawOverlay(detections, jack, usable ? ranking : []);
-  renderRanking(ranking, usable, reason, detections.length);
+  drawOverlay(result.detections, result.jack, result.usable ? result.ranking : []);
+  renderRanking(result.ranking, result.usable, result.reason, result.detections.length);
 
   rafId = requestAnimationFrame(processFrame);
 }
@@ -102,7 +127,7 @@ function drawOverlay(detections, jack, ranking) {
     drawAura(d, color, isJack);
   }
 
-  ranking.forEach((entry, i) => drawFlag(entry.bowl, i + 1));
+  ranking.forEach((entry, i) => drawFlag(entry.bowl, i + 1, i === 0 ? '#2e7d32' : '#1565c0'));
 }
 
 function drawAura(d, color, isJack) {
@@ -131,7 +156,7 @@ function hexToRgba(hex, alpha) {
 }
 
 // Small pennant on a pole above a bowl, labeled with its closeness rank (1 = closest to jack).
-function drawFlag(d, rank) {
+function drawFlag(d, rank, fillColor) {
   const poleX = d.x;
   const baseY = d.y - d.r;
   const topY = baseY - d.r * 1.8;
@@ -150,7 +175,7 @@ function drawFlag(d, rank) {
   overlayCtx.lineTo(poleX + flagW, topY + flagH * 0.3);
   overlayCtx.lineTo(poleX, topY + flagH);
   overlayCtx.closePath();
-  overlayCtx.fillStyle = rank === 1 ? '#2e7d32' : '#1565c0';
+  overlayCtx.fillStyle = fillColor;
   overlayCtx.fill();
   overlayCtx.strokeStyle = 'rgba(0,0,0,0.4)';
   overlayCtx.lineWidth = 1;
@@ -178,4 +203,108 @@ function renderRanking(ranking, usable, reason, detectionCount) {
     li.textContent = `#${i + 1} bowl — ${entry.dist.toFixed(2)} bowl-diameters from jack`;
     rankingEl.appendChild(li);
   });
+}
+
+// --- Frozen end: tap-to-assign team ownership, closest bowl first --------
+
+const TEAM_COLORS = { mine: '#2e7d32', theirs: '#c62828' };
+const UNASSIGNED_FLAG_COLOR = '#616161';
+const ASSIGNMENT_CYCLE = [null, 'mine', 'theirs'];
+
+function renderFrozen() {
+  overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
+
+  for (const d of frozen.detections) {
+    const isJack = d === frozen.jack;
+    const rankIndex = frozen.ranking.findIndex(entry => entry.bowl === d);
+    const color = isJack ? JACK_COLOR : rankIndex >= 0 ? RANK_COLORS[Math.min(rankIndex, RANK_COLORS.length - 1)] : UNRANKED_COLOR;
+    drawAura(d, color, isJack);
+  }
+
+  frozen.ranking.forEach((entry, i) => {
+    const flagColor = assignments[i] ? TEAM_COLORS[assignments[i]] : UNASSIGNED_FLAG_COLOR;
+    drawFlag(entry.bowl, i + 1, flagColor);
+  });
+
+  renderScoreUI();
+}
+
+function renderScoreUI() {
+  rankingEl.innerHTML = '';
+
+  const summary = document.createElement('li');
+  summary.style.fontWeight = 'bold';
+
+  if (frozen.ranking.length === 0) {
+    summary.textContent = 'No bowls to score (only the jack was detected).';
+  } else {
+    const score = LawnBowlsDetection.computeScore(assignments);
+    if (score.team === null) {
+      summary.textContent = "Tap the closest bowl's flag to say whose it is.";
+    } else {
+      const label = score.team === 'mine' ? 'You' : 'Opponent';
+      summary.textContent = score.pending
+        ? `${label}: at least ${score.count} — keep tagging to confirm`
+        : `${label} score this end: ${score.count}`;
+    }
+  }
+  rankingEl.appendChild(summary);
+
+  frozen.ranking.forEach((entry, i) => {
+    const li = document.createElement('li');
+    const team = assignments[i];
+    const label = team === 'mine' ? 'Mine' : team === 'theirs' ? "Theirs" : 'Unassigned — tap to set';
+    li.textContent = `#${i + 1} bowl — ${entry.dist.toFixed(2)} bowl-diameters from jack — ${label}`;
+    li.style.cursor = 'pointer';
+    li.addEventListener('click', () => cycleAssignment(i));
+    rankingEl.appendChild(li);
+  });
+}
+
+function cycleAssignment(i) {
+  const current = ASSIGNMENT_CYCLE.indexOf(assignments[i]);
+  assignments[i] = ASSIGNMENT_CYCLE[(current + 1) % ASSIGNMENT_CYCLE.length];
+  renderFrozen();
+}
+
+function handleCanvasTap(evt) {
+  if (!frozen) return;
+
+  const pt = canvasPointFromEvent(evt);
+  let bestIndex = -1;
+  let bestDist = Infinity;
+
+  frozen.ranking.forEach((entry, i) => {
+    const d = entry.bowl;
+    // Bias the hit region up toward the flag, since that's the visible tap target.
+    const hitCx = d.x;
+    const hitCy = d.y - d.r * 1.4;
+    const hitR = Math.max(d.r * 1.8, 26);
+    const dist = Math.hypot(pt.x - hitCx, pt.y - hitCy);
+    if (dist < hitR && dist < bestDist) {
+      bestDist = dist;
+      bestIndex = i;
+    }
+  });
+
+  if (bestIndex >= 0) cycleAssignment(bestIndex);
+}
+
+// Maps a click's CSS-pixel position to the canvas's internal pixel space,
+// accounting for object-fit:cover scaling (which crops rather than stretches).
+function canvasPointFromEvent(evt) {
+  const rect = overlay.getBoundingClientRect();
+  const cssX = evt.clientX - rect.left;
+  const cssY = evt.clientY - rect.top;
+
+  const scale = Math.max(rect.width / overlay.width, rect.height / overlay.height);
+  const renderedW = overlay.width * scale;
+  const renderedH = overlay.height * scale;
+  const offsetX = (rect.width - renderedW) / 2;
+  const offsetY = (rect.height - renderedH) / 2;
+
+  return {
+    x: (cssX - offsetX) / scale,
+    y: (cssY - offsetY) / scale,
+  };
 }
