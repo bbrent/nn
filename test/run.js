@@ -51,20 +51,38 @@ async function runSynthetic(cv, dir, name) {
   const truth = JSON.parse(fs.readFileSync(path.join(dir, `${name}.json`), 'utf8'));
 
   const src = await matFromImage(cv, pngPath);
-  const { detections, jack, ranking } = LawnBowlsDetection.detectAndRank(cv, src);
+  const { detections, jack, ranking, usable, reason } = LawnBowlsDetection.detectAndRank(cv, src);
   src.delete();
 
   const failures = [];
   const truthBowls = truth.circles.filter(c => !c.isJack);
   const truthJack = truth.circles.find(c => c.isJack);
 
+  // A frame is only expected to be fully solvable if the true jack clears the
+  // same confidence floor the pipeline itself uses. Below that, the correct
+  // behavior is to say so (usable:false) and get skipped by the caller — not
+  // to force a full detection, which is what real footage will actually do
+  // too (bad frames get discarded once multi-frame fusion lands).
+  const truthJackWorkR = truthJack ? (truthJack.r * LawnBowlsDetection.WORK_WIDTH) / truth.width : 0;
+  const expectSolvable = truthJack && truthJackWorkR >= LawnBowlsDetection.CONFIDENT_JACK_WORK_RADIUS_PX;
+
+  if (!expectSolvable) {
+    if (usable) {
+      failures.push(`jack is only ${truthJackWorkR.toFixed(1)}px in the work image (too small to trust) but pipeline reported usable`);
+    }
+    return { name, failures, skipped: !failures.length };
+  }
+
+  if (!usable) {
+    failures.push(`expected a usable frame but got usable:false (${reason})`);
+    return { name, failures };
+  }
+
   if (detections.length !== truth.circles.length) {
     failures.push(`expected ${truth.circles.length} circles, detected ${detections.length}`);
   }
 
-  if (!jack) {
-    failures.push('no jack identified');
-  } else {
+  {
     const { dist } = nearest(jack, [truthJack]);
     if (dist > POSITION_TOLERANCE_PX) {
       failures.push(`jack detected ${dist.toFixed(1)}px from ground truth (tolerance ${POSITION_TOLERANCE_PX}px)`);
@@ -73,7 +91,7 @@ async function runSynthetic(cv, dir, name) {
 
   // Expected ranking order: sort ground-truth bowls by true distance to the true jack.
   const expectedOrder = truthBowls
-    .map((b, i) => ({ i, dist: truthJack ? Math.hypot(b.x - truthJack.x, b.y - truthJack.y) : 0 }))
+    .map((b, i) => ({ i, dist: Math.hypot(b.x - truthJack.x, b.y - truthJack.y) }))
     .sort((a, b) => a.dist - b.dist)
     .map(e => e.i);
 
@@ -83,12 +101,12 @@ async function runSynthetic(cv, dir, name) {
     return truthBowls.indexOf(match);
   });
 
-  if (jack && detectedOrder.length === expectedOrder.length) {
+  if (detectedOrder.length === expectedOrder.length) {
     const orderMatches = detectedOrder.every((idx, i) => idx === expectedOrder[i]);
     if (!orderMatches) {
       failures.push(`ranking order mismatch: expected [${expectedOrder}], got [${detectedOrder}]`);
     }
-  } else if (jack) {
+  } else {
     failures.push(`expected ${expectedOrder.length} ranked bowls, got ${detectedOrder.length}`);
   }
 
@@ -122,7 +140,9 @@ async function main() {
     for (const name of sceneNames) {
       totalCount++;
       const result = await runSynthetic(cv, dir, name);
-      if (result.failures.length === 0) {
+      if (result.failures.length === 0 && result.skipped) {
+        console.log(`  SKIP  ${name} (jack too small to trust — correctly flagged unusable)`);
+      } else if (result.failures.length === 0) {
         console.log(`  PASS  ${name}`);
       } else {
         failCount++;

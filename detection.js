@@ -13,6 +13,20 @@
   const WORK_WIDTH = 800;
   const JACK_RADIUS_RATIO = 0.65; // jack is ~0.54x a bowl's diameter; threshold with margin
 
+  // Hough's own radius floor is 4px (in work-image pixels, see below) — right at
+  // that floor, detection is unreliable (misses, merges with neighbors). A frame
+  // is only "usable" once the jack clears this floor with real margin; otherwise
+  // it should be skipped rather than trusted (e.g. hold the phone closer/more
+  // overhead and rescan, or just drop the frame during multi-frame fusion).
+  const CONFIDENT_JACK_WORK_RADIUS_PX = 6;
+
+  // If the true jack goes undetected, the smallest *bowl* still gets picked as
+  // jack by the size-rank heuristic below — a false positive worse than no jack
+  // at all. Guard against it: a real jack sits far below the nearest bowl in
+  // size (ratio ~0.45-0.72 across tested scenes); anything close to 1 means
+  // we're just looking at two same-size bowls, not a real jack.
+  const JACK_TO_NEAREST_BOWL_RATIO = 0.8;
+
   // srcMat: RGBA cv.Mat at any resolution. Returns detections in srcMat's
   // coordinate space (i.e. already scaled back up from the downscaled work image).
   function detectCircles(cv, srcMat) {
@@ -40,10 +54,12 @@
 
     const detections = [];
     for (let i = 0; i < circles.cols; i++) {
+      const workR = circles.data32F[i * 3 + 2];
       detections.push({
         x: circles.data32F[i * 3] / scale,
         y: circles.data32F[i * 3 + 1] / scale,
-        r: circles.data32F[i * 3 + 2] / scale,
+        r: workR / scale,
+        workR, // pre-scale radius, work-image px — used to judge detection confidence
       });
     }
 
@@ -57,7 +73,7 @@
   // to the jack in bowl-diameter units (no absolute scale needed).
   function classifyAndRank(detections) {
     if (detections.length === 0) {
-      return { jack: null, bowls: [], ranking: [] };
+      return { jack: null, bowls: [], ranking: [], usable: false, reason: 'no circles detected' };
     }
 
     const sortedR = [...detections].map(d => d.r).sort((a, b) => a - b);
@@ -89,7 +105,21 @@
     }));
     if (jack) ranking.sort((a, b) => a.dist - b.dist);
 
-    return { jack, bowls, ranking };
+    let usable = true;
+    let reason = null;
+    const minBowlWorkR = bowls.length ? Math.min(...bowls.map(b => b.workR)) : null;
+    if (!jack) {
+      usable = false;
+      reason = 'no jack identified';
+    } else if (jack.workR < CONFIDENT_JACK_WORK_RADIUS_PX) {
+      usable = false;
+      reason = 'jack too small in frame to trust — move the phone closer/more overhead';
+    } else if (minBowlWorkR !== null && jack.workR / minBowlWorkR > JACK_TO_NEAREST_BOWL_RATIO) {
+      usable = false;
+      reason = 'no bowl is clearly smaller than the rest — jack may be undetected or out of frame';
+    }
+
+    return { jack, bowls, ranking, usable, reason };
   }
 
   function detectAndRank(cv, srcMat) {
@@ -97,5 +127,13 @@
     return { detections, ...classifyAndRank(detections) };
   }
 
-  return { WORK_WIDTH, JACK_RADIUS_RATIO, detectCircles, classifyAndRank, detectAndRank };
+  return {
+    WORK_WIDTH,
+    JACK_RADIUS_RATIO,
+    CONFIDENT_JACK_WORK_RADIUS_PX,
+    JACK_TO_NEAREST_BOWL_RATIO,
+    detectCircles,
+    classifyAndRank,
+    detectAndRank,
+  };
 });

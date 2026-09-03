@@ -77,11 +77,11 @@ function processFrame() {
   if (!scanning) return;
 
   const src = cv.imread(video);
-  const { detections, jack, ranking } = LawnBowlsDetection.detectAndRank(cv, src);
+  const { detections, jack, ranking, usable, reason } = LawnBowlsDetection.detectAndRank(cv, src);
   src.delete();
 
   drawOverlay(detections, jack);
-  renderRanking(ranking, jack !== null, detections.length);
+  renderRanking(ranking, usable, reason, detections.length);
 
   rafId = requestAnimationFrame(processFrame);
 }
@@ -97,14 +97,12 @@ function drawOverlay(detections, jack) {
   }
 }
 
-function renderRanking(ranking, haveJack, detectionCount) {
+function renderRanking(ranking, usable, reason, detectionCount) {
   rankingEl.innerHTML = '';
 
-  if (!haveJack) {
+  if (!usable) {
     const li = document.createElement('li');
-    li.textContent = detectionCount
-      ? `${detectionCount} circle(s) detected, no jack identified yet`
-      : 'No circles detected';
+    li.textContent = `${reason} (${detectionCount} circle(s) detected)`;
     rankingEl.appendChild(li);
     return;
   }
