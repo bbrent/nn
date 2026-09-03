@@ -80,21 +80,87 @@ function processFrame() {
   const { detections, jack, ranking, usable, reason } = LawnBowlsDetection.detectAndRank(cv, src);
   src.delete();
 
-  drawOverlay(detections, jack);
+  drawOverlay(detections, jack, usable ? ranking : []);
   renderRanking(ranking, usable, reason, detections.length);
 
   rafId = requestAnimationFrame(processFrame);
 }
 
-function drawOverlay(detections, jack) {
+// Closest-to-farthest color scale for ranked bowls; unranked detections (jack
+// aside) fall back to blue.
+const RANK_COLORS = ['#66bb6a', '#9ccc65', '#ffee58', '#ffb74d', '#ef5350'];
+const JACK_COLOR = '#ffd54f';
+const UNRANKED_COLOR = '#42a5f5';
+
+function drawOverlay(detections, jack, ranking) {
   overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
+
   for (const d of detections) {
-    overlayCtx.beginPath();
-    overlayCtx.arc(d.x, d.y, d.r, 0, 2 * Math.PI);
-    overlayCtx.strokeStyle = d === jack ? '#ffd54f' : '#42a5f5';
-    overlayCtx.lineWidth = 3;
-    overlayCtx.stroke();
+    const isJack = d === jack;
+    const rankIndex = ranking.findIndex(entry => entry.bowl === d);
+    const color = isJack ? JACK_COLOR : rankIndex >= 0 ? RANK_COLORS[Math.min(rankIndex, RANK_COLORS.length - 1)] : UNRANKED_COLOR;
+    drawAura(d, color, isJack);
   }
+
+  ranking.forEach((entry, i) => drawFlag(entry.bowl, i + 1));
+}
+
+function drawAura(d, color, isJack) {
+  const glowR = d.r * 2.2;
+  const gradient = overlayCtx.createRadialGradient(d.x, d.y, d.r * 0.6, d.x, d.y, glowR);
+  gradient.addColorStop(0, hexToRgba(color, 0.5));
+  gradient.addColorStop(1, hexToRgba(color, 0));
+  overlayCtx.fillStyle = gradient;
+  overlayCtx.beginPath();
+  overlayCtx.arc(d.x, d.y, glowR, 0, 2 * Math.PI);
+  overlayCtx.fill();
+
+  overlayCtx.beginPath();
+  overlayCtx.arc(d.x, d.y, d.r, 0, 2 * Math.PI);
+  overlayCtx.strokeStyle = color;
+  overlayCtx.lineWidth = isJack ? 3 : 2.5;
+  overlayCtx.stroke();
+}
+
+function hexToRgba(hex, alpha) {
+  const n = parseInt(hex.slice(1), 16);
+  const r = (n >> 16) & 255;
+  const g = (n >> 8) & 255;
+  const b = n & 255;
+  return `rgba(${r},${g},${b},${alpha})`;
+}
+
+// Small pennant on a pole above a bowl, labeled with its closeness rank (1 = closest to jack).
+function drawFlag(d, rank) {
+  const poleX = d.x;
+  const baseY = d.y - d.r;
+  const topY = baseY - d.r * 1.8;
+
+  overlayCtx.beginPath();
+  overlayCtx.moveTo(poleX, baseY);
+  overlayCtx.lineTo(poleX, topY);
+  overlayCtx.strokeStyle = '#ffffff';
+  overlayCtx.lineWidth = 2;
+  overlayCtx.stroke();
+
+  const flagW = Math.max(18, d.r * 1.1);
+  const flagH = flagW * 0.65;
+  overlayCtx.beginPath();
+  overlayCtx.moveTo(poleX, topY);
+  overlayCtx.lineTo(poleX + flagW, topY + flagH * 0.3);
+  overlayCtx.lineTo(poleX, topY + flagH);
+  overlayCtx.closePath();
+  overlayCtx.fillStyle = rank === 1 ? '#2e7d32' : '#1565c0';
+  overlayCtx.fill();
+  overlayCtx.strokeStyle = 'rgba(0,0,0,0.4)';
+  overlayCtx.lineWidth = 1;
+  overlayCtx.stroke();
+
+  overlayCtx.fillStyle = '#ffffff';
+  overlayCtx.font = `bold ${Math.max(11, flagH * 0.55)}px system-ui, sans-serif`;
+  overlayCtx.textAlign = 'center';
+  overlayCtx.textBaseline = 'middle';
+  overlayCtx.fillText(String(rank), poleX + flagW * 0.4, topY + flagH * 0.32);
 }
 
 function renderRanking(ranking, usable, reason, detectionCount) {
