@@ -1,8 +1,10 @@
 // Runs the shared detection pipeline (detection.js) against static fixture
 // images and checks results against ground truth. Run: npm test
 //
-// Two kinds of fixtures:
-//   fixtures/synthetic/*.png + .json  — generated, has ground truth, asserted
+// Three kinds of fixtures:
+//   fixtures/synthetic/*.png + .json  — flat 2D canvas circles, ground truth, asserted
+//   fixtures/three-js/*.png + .json   — real WebGL 3D render (perspective, shadows,
+//                                        noise), ground truth, asserted
 //   fixtures/real/*.jpg               — real phone photos, no ground truth;
 //                                        printed for manual eyeballing only
 
@@ -11,7 +13,10 @@ const path = require('path');
 const { loadImage, createCanvas } = require('canvas');
 const LawnBowlsDetection = require('../detection.js');
 
-const SYNTHETIC_DIR = path.join(__dirname, 'fixtures', 'synthetic');
+const GROUND_TRUTH_DIRS = [
+  { label: '2D synthetic', dir: path.join(__dirname, 'fixtures', 'synthetic') },
+  { label: '3D (three.js)', dir: path.join(__dirname, 'fixtures', 'three-js') },
+];
 const REAL_DIR = path.join(__dirname, 'fixtures', 'real');
 
 // Ground-truth circles use image-pixel radius directly; detector position
@@ -41,9 +46,9 @@ function nearest(point, candidates) {
   return { match: best, dist: bestDist };
 }
 
-async function runSynthetic(cv, name) {
-  const pngPath = path.join(SYNTHETIC_DIR, `${name}.png`);
-  const truth = JSON.parse(fs.readFileSync(path.join(SYNTHETIC_DIR, `${name}.json`), 'utf8'));
+async function runSynthetic(cv, dir, name) {
+  const pngPath = path.join(dir, `${name}.png`);
+  const truth = JSON.parse(fs.readFileSync(path.join(dir, `${name}.json`), 'utf8'));
 
   const src = await matFromImage(cv, pngPath);
   const { detections, jack, ranking } = LawnBowlsDetection.detectAndRank(cv, src);
@@ -103,23 +108,29 @@ async function runReal(cv, filename) {
 async function main() {
   const cv = await require('@techstark/opencv-js');
 
-  const sceneNames = fs
-    .readdirSync(SYNTHETIC_DIR)
-    .filter(f => f.endsWith('.png'))
-    .map(f => f.replace(/\.png$/, ''));
-
-  console.log(`Running ${sceneNames.length} synthetic fixture(s)...\n`);
-
+  let totalCount = 0;
   let failCount = 0;
-  for (const name of sceneNames) {
-    const result = await runSynthetic(cv, name);
-    if (result.failures.length === 0) {
-      console.log(`  PASS  ${name}`);
-    } else {
-      failCount++;
-      console.log(`  FAIL  ${name}`);
-      result.failures.forEach(f => console.log(`          - ${f}`));
+
+  for (const { label, dir } of GROUND_TRUTH_DIRS) {
+    if (!fs.existsSync(dir)) continue;
+    const sceneNames = fs
+      .readdirSync(dir)
+      .filter(f => f.endsWith('.png'))
+      .map(f => f.replace(/\.png$/, ''));
+
+    console.log(`${label} (${sceneNames.length} fixture(s)):`);
+    for (const name of sceneNames) {
+      totalCount++;
+      const result = await runSynthetic(cv, dir, name);
+      if (result.failures.length === 0) {
+        console.log(`  PASS  ${name}`);
+      } else {
+        failCount++;
+        console.log(`  FAIL  ${name}`);
+        result.failures.forEach(f => console.log(`          - ${f}`));
+      }
     }
+    console.log('');
   }
 
   const realFiles = fs.existsSync(REAL_DIR)
@@ -127,15 +138,15 @@ async function main() {
     : [];
 
   if (realFiles.length > 0) {
-    console.log(`\nReal photo fixtures (no ground truth, informational only):`);
+    console.log(`Real photo fixtures (no ground truth, informational only):`);
     for (const f of realFiles) {
       await runReal(cv, f);
     }
   } else {
-    console.log(`\nNo real-photo fixtures in test/fixtures/real/ yet — drop phone photos there to sanity-check detection on actual bowls.`);
+    console.log(`No real-photo fixtures in test/fixtures/real/ yet — drop phone photos there to sanity-check detection on actual bowls.`);
   }
 
-  console.log(`\n${sceneNames.length - failCount}/${sceneNames.length} synthetic fixtures passed.`);
+  console.log(`\n${totalCount - failCount}/${totalCount} fixtures passed.`);
   process.exit(failCount > 0 ? 1 : 0);
 }
 

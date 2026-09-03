@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>html,body{margin:0;padding:0;background:#000;}</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script type="module">
+import * as THREE from '/node_modules/three/build/three.module.js';
+
+function makeTurfTexture(seed, size) {
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#2e7d32';
+  ctx.fillRect(0, 0, size, size);
+
+  let s = seed >>> 0;
+  function rand() {
+    s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
+    return s / 4294967296;
+  }
+  for (let i = 0; i < (size * size) / 6; i++) {
+    const x = rand() * size;
+    const y = rand() * size;
+    ctx.fillStyle = rand() > 0.5 ? 'rgba(0,0,0,0.10)' : 'rgba(255,255,255,0.08)';
+    ctx.fillRect(x, y, 1.5, 1.5);
+  }
+
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
+// config: { width, height, groundSize, seed, camera: {fov, position:[x,y,z], lookAt:[x,y,z]},
+//           circles: [{x, z, radius, color, isJack}] }  (x,z in meters, ground plane)
+// Returns ground truth in screen pixels: [{x, y, r, isJack}]
+window.renderScene = function (config) {
+  const { width, height, groundSize, camera: camCfg, circles, seed } = config;
+
+  const canvas = document.getElementById('c');
+  canvas.width = width;
+  canvas.height = height;
+
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, preserveDrawingBuffer: true });
+  renderer.setSize(width, height, false);
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x111111);
+
+  const camera = new THREE.PerspectiveCamera(camCfg.fov, width / height, 0.05, 100);
+  camera.position.set(...camCfg.position);
+  camera.lookAt(...camCfg.lookAt);
+  camera.updateMatrixWorld();
+
+  scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+  const dir = new THREE.DirectionalLight(0xffffff, 1.15);
+  dir.position.set(3, 6, 2);
+  dir.castShadow = true;
+  dir.shadow.mapSize.set(1024, 1024);
+  const half = groundSize / 2;
+  Object.assign(dir.shadow.camera, { left: -half, right: half, top: half, bottom: -half });
+  scene.add(dir);
+
+  const turf = makeTurfTexture(seed, 512);
+  turf.repeat.set(groundSize, groundSize);
+  const ground = new THREE.Mesh(
+    new THREE.PlaneGeometry(groundSize, groundSize),
+    new THREE.MeshStandardMaterial({ map: turf, roughness: 0.95 })
+  );
+  ground.rotation.x = -Math.PI / 2;
+  ground.receiveShadow = true;
+  scene.add(ground);
+
+  for (const c of circles) {
+    const mesh = new THREE.Mesh(
+      new THREE.SphereGeometry(c.radius, 32, 32),
+      new THREE.MeshStandardMaterial({ color: c.color, roughness: 0.35, metalness: 0.15 })
+    );
+    mesh.position.set(c.x, c.radius, c.z);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    scene.add(mesh);
+  }
+
+  renderer.render(scene, camera);
+
+  // Project each sphere's center, plus a radius-offset point along the camera's
+  // screen-space horizontal, to get true apparent pixel radius under perspective.
+  const camRight = new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 0);
+  function project(v) {
+    const p = v.clone().project(camera);
+    return { x: (p.x * 0.5 + 0.5) * width, y: (1 - (p.y * 0.5 + 0.5)) * height };
+  }
+
+  return circles.map(c => {
+    const center = new THREE.Vector3(c.x, c.radius, c.z);
+    const edge = center.clone().addScaledVector(camRight, c.radius);
+    const pc = project(center);
+    const pe = project(edge);
+    return { x: pc.x, y: pc.y, r: Math.hypot(pe.x - pc.x, pe.y - pc.y), isJack: !!c.isJack };
+  });
+};
+
+window.__sceneReady = true;
+</script>
+</body>
+</html>

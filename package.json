@@ -5,7 +5,8 @@
   "main": "app.js",
   "scripts": {
     "test": "node test/run.js",
-    "generate-fixtures": "node test/generate-fixtures.js"
+    "generate-fixtures": "node test/generate-fixtures.js",
+    "generate-fixtures:three": "node test/generate-three-fixtures.js"
   },
   "repository": {
     "type": "git",
@@ -20,6 +21,8 @@
   "homepage": "https://github.com/bbrent/nn#readme",
   "devDependencies": {
     "@techstark/opencv-js": "^5.0.0-release.1",
-    "canvas": "^3.2.3"
+    "canvas": "^3.2.3",
+    "playwright": "^1.62.1",
+    "three": "^0.185.1"
   }
 }
