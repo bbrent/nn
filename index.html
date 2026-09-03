@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Lawn Bowls Scorer</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="stage">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="overlay"></canvas>
+  </div>
+
+  <div id="hud">
+    <div id="status">Loading OpenCV…</div>
+    <div id="controls">
+      <button id="scanBtn" disabled>Start Scan</button>
+    </div>
+    <ul id="ranking"></ul>
+  </div>
+
+  <script src="app.js"></script>
+  <script async src="https://docs.opencv.org/4.x/opencv.js" onload="onOpenCvReady()"></script>
+</body>
+</html>
