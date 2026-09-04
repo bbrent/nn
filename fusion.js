@@ -171,11 +171,20 @@
 
   // Bowls ranked by distance to the (always jack-centered-at-origin) jack,
   // shaped like detection.js's ranking so the same UI code can consume either.
-  function getSnapshot(fusion) {
-    const ranking = fusion.bowls
+  // confirmedOnly drops landmarks seen fewer than CONFIRM_OBSERVATIONS times —
+  // a stray object (a shoe, a hand) that got Hough-detected once or twice
+  // should not end up permanently scored as a bowl. Live status display wants
+  // the unfiltered view (to show "N tracked, M confirmed"); freezing the map
+  // for scoring wants confirmedOnly so noise doesn't get locked in.
+  function getSnapshot(fusion, opts) {
+    const confirmedOnly = opts && opts.confirmedOnly;
+    const bowls = confirmedOnly
+      ? fusion.bowls.filter(b => b.observations >= CONFIRM_OBSERVATIONS)
+      : fusion.bowls;
+    const ranking = bowls
       .map(b => ({ bowl: b, dist: Math.hypot(b.x, b.y), confirmed: b.observations >= CONFIRM_OBSERVATIONS }))
       .sort((a, b) => a.dist - b.dist);
-    return { jack: { x: 0, y: 0 }, bowls: fusion.bowls, ranking, frameCount: fusion.frameCount };
+    return { jack: { x: 0, y: 0 }, bowls, ranking, frameCount: fusion.frameCount };
   }
 
   // Maps a snapshot's bowl-diameter-unit coordinates into canvas pixel space

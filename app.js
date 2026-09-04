@@ -89,7 +89,10 @@ function toggleScan() {
 
     // Lay out the fused map (not just the last frame) so bowls seen anywhere
     // during the pan — even if out of frame now — have stable positions to tap.
-    const snapshot = LawnBowlsFusion.getSnapshot(fusion);
+    // confirmedOnly: a stray object Hough-detected once or twice (a shoe, a
+    // hand) shouldn't get permanently scored as a bowl just because it was
+    // in frame briefly — only landmarks seen consistently make the cut.
+    const snapshot = LawnBowlsFusion.getSnapshot(fusion, { confirmedOnly: true });
     if (snapshot.bowls.length > 0) {
       frozen = LawnBowlsFusion.layoutForCanvas(snapshot, overlay.width, overlay.height);
       assignments = new Array(frozen.ranking.length).fill(null);
@@ -100,7 +103,7 @@ function toggleScan() {
       assignments = [];
       overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
       rankingEl.innerHTML = '';
-      setStatus('No usable frames were scanned — rescan and hold steady over the bowls.');
+      setStatus('No bowl was seen consistently enough to trust — rescan and hold steadier over each one.');
     }
   } else {
     scanning = true;

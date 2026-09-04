@@ -131,7 +131,39 @@ function run() {
     if (!allConfirmed) failures.push('case4: all landmarks should be confirmed after enough repeated views');
   }
 
-  return { name: 'fusion', total: 4, failures };
+  // Case 5: a stray object seen only once or twice (a shoe, a hand) — should
+  // count toward the live "tracked" total but be dropped from confirmedOnly,
+  // since that's what feeds the frozen/scored map.
+  {
+    const fusion = LawnBowlsFusion.createFusion();
+    // Bowls 0,1,2 seen enough times to confirm...
+    for (let i = 0; i < LawnBowlsFusion.CONFIRM_OBSERVATIONS; i++) {
+      LawnBowlsFusion.addFrame(fusion, makeFrame([0, 1, 2], i * 0.3));
+    }
+    // ...plus one frame with a stray extra point (distance 5, far from any
+    // real bowl) seen only this once. Uses bowls 0 and 2 (well-separated
+    // distances) rather than 0 and 1, which are close enough to each other
+    // to be mutually ambiguous under MATCH_MARGIN — correctly so, that's a
+    // real limitation, not what this case is testing.
+    const strayFrame = makeFrame([0, 2], 0.9);
+    strayFrame.ranking.push({ bowl: { stray: true }, dist: 5, localX: 5, localY: 0 });
+    LawnBowlsFusion.addFrame(fusion, strayFrame);
+
+    const unfiltered = LawnBowlsFusion.getSnapshot(fusion);
+    const filtered = LawnBowlsFusion.getSnapshot(fusion, { confirmedOnly: true });
+
+    if (unfiltered.bowls.length !== 4) {
+      failures.push(`case5: expected 4 tracked landmarks (3 real + 1 stray), got ${unfiltered.bowls.length}`);
+    }
+    if (filtered.bowls.length !== 3) {
+      failures.push(`case5: expected 3 confirmed landmarks (stray excluded), got ${filtered.bowls.length}`);
+    }
+    if (filtered.bowls.some(b => Math.hypot(b.x, b.y) > 4)) {
+      failures.push('case5: stray landmark leaked into confirmedOnly snapshot');
+    }
+  }
+
+  return { name: 'fusion', total: 5, failures };
 }
 
 module.exports = { run };
