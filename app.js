@@ -20,6 +20,7 @@ let frozen = null; // { detections, jack, ranking } laid out from the fused map 
 let assignments = []; // parallel to frozen.ranking: 'mine' | 'theirs' | null
 
 let video, overlay, overlayCtx, statusEl, rankingEl, scanBtn;
+let captureCanvas, captureCtx; // offscreen: cv.imread() needs a canvas/img, not a <video>, as its source
 
 function onOpenCvReady() {
   cv['onRuntimeInitialized'] = () => {
@@ -35,6 +36,8 @@ document.addEventListener('DOMContentLoaded', () => {
   statusEl = document.getElementById('status');
   rankingEl = document.getElementById('ranking');
   scanBtn = document.getElementById('scanBtn');
+  captureCanvas = document.createElement('canvas');
+  captureCtx = captureCanvas.getContext('2d', { willReadFrequently: true });
 
   scanBtn.addEventListener('click', toggleScan);
   overlay.addEventListener('click', handleCanvasTap);
@@ -69,6 +72,8 @@ function sizeOverlay() {
   if (!video.videoWidth) return;
   overlay.width = video.videoWidth;
   overlay.height = video.videoHeight;
+  captureCanvas.width = video.videoWidth;
+  captureCanvas.height = video.videoHeight;
 }
 
 function setStatus(msg) {
@@ -114,7 +119,8 @@ function processFrame() {
   if (!scanning) return;
 
   try {
-    const src = cv.imread(video);
+    captureCtx.drawImage(video, 0, 0, captureCanvas.width, captureCanvas.height);
+    const src = cv.imread(captureCanvas);
     const result = LawnBowlsDetection.detectAndRank(cv, src);
     src.delete();
 
