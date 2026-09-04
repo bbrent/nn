@@ -34,6 +34,18 @@
   const MERGE_RADIUS = 0.4;
   // Observations needed before a landmark is considered stable ("consensus").
   const CONFIRM_OBSERVATIONS = 3;
+  // Misses (camera clearly looked right at the spot, found nothing) before a
+  // landmark is pruned. >1 so a single frame of occlusion (a foot passing
+  // over a real bowl) doesn't remove it — it takes a couple of clean looks
+  // that come back empty.
+  const MISS_THRESHOLD = 2;
+  // How close to this frame's confidently-matched landmarks (bowl-diameter
+  // units) counts as "clearly just looked here" for pruning purposes. Fixed
+  // and deliberately small/conservative — this bounds the "blast radius" of
+  // any single frame's pruning decision to a tight, well-understood
+  // neighborhood, rather than scaling with however far this particular
+  // frame happened to span.
+  const OBSERVED_REGION_RADIUS = 1.0;
 
   function createFusion() {
     return { jackSeen: 0, bowls: [], frameCount: 0 };
@@ -129,8 +141,8 @@
 
     if (fusion.bowls.length === 0) {
       // First frame: its own orientation becomes the world frame.
-      for (const p of localPoints) fusion.bowls.push({ x: p.x, y: p.y, observations: 1 });
-      return { merged: true, newLandmarks: localPoints.length, reason: null };
+      for (const p of localPoints) fusion.bowls.push({ x: p.x, y: p.y, observations: 1, misses: 0 });
+      return { merged: true, newLandmarks: localPoints.length, removedLandmarks: 0, reason: null };
     }
 
     const matches = findConfidentMatches(localPoints, fusion.bowls);
@@ -138,12 +150,18 @@
       return { merged: false, reason: 'no confident overlap with existing map' };
     }
 
+    // Snapshot matched landmarks' current positions before this frame's merge
+    // updates them below — these anchor the "we clearly just looked here"
+    // region for pruning, since they're what we're already confident about.
+    const matchedWorldPoints = matches.map(m => ({ x: fusion.bowls[m.worldIndex].x, y: fusion.bowls[m.worldIndex].y }));
+
     const theta = solveRotationRobust(localPoints, fusion.bowls, matches);
+    const rotatedPoints = localPoints.map(p => rotate(p, theta));
 
     let newLandmarks = 0;
-    for (const p of localPoints) {
-      const rotated = rotate(p, theta);
+    const seenIndices = new Set();
 
+    for (const rotated of rotatedPoints) {
       let bestIndex = -1;
       let bestDist = Infinity;
       fusion.bowls.forEach((w, j) => {
@@ -160,13 +178,42 @@
         landmark.x = (landmark.x * n + rotated.x) / (n + 1);
         landmark.y = (landmark.y * n + rotated.y) / (n + 1);
         landmark.observations = n + 1;
+        landmark.misses = 0;
+        seenIndices.add(bestIndex);
       } else {
-        fusion.bowls.push({ x: rotated.x, y: rotated.y, observations: 1 });
+        fusion.bowls.push({ x: rotated.x, y: rotated.y, observations: 1, misses: 0 });
+        seenIndices.add(fusion.bowls.length - 1);
         newLandmarks++;
       }
     }
 
-    return { merged: true, newLandmarks, reason: null };
+    // Prune landmarks that should have been visible this frame (near what we
+    // just confidently re-matched, jack included) but weren't matched to
+    // anything — real evidence the spot was checked and came up empty, not
+    // just "we haven't looked there in a while." Anchored to matched points
+    // specifically (not all of this frame's points) and capped at a small
+    // fixed radius, not one that scales with the frame's own spread — a wide
+    // shot spanning near and far bowls shouldn't inflate how much area counts
+    // as "clearly checked," or it'll prune things that were genuinely just
+    // out of frame.
+    const observedAnchors = [{ x: 0, y: 0 }, ...matchedWorldPoints];
+    const cx = observedAnchors.reduce((s, p) => s + p.x, 0) / observedAnchors.length;
+    const cy = observedAnchors.reduce((s, p) => s + p.y, 0) / observedAnchors.length;
+
+    let removedLandmarks = 0;
+    fusion.bowls = fusion.bowls.filter((landmark, j) => {
+      if (seenIndices.has(j)) return true;
+      const inView = Math.hypot(landmark.x - cx, landmark.y - cy) < OBSERVED_REGION_RADIUS;
+      if (!inView) return true; // outside this frame's view — no evidence either way
+      landmark.misses = (landmark.misses || 0) + 1;
+      if (landmark.misses >= MISS_THRESHOLD) {
+        removedLandmarks++;
+        return false;
+      }
+      return true;
+    });
+
+    return { merged: true, newLandmarks, removedLandmarks, reason: null };
   }
 
   // Bowls ranked by distance to the (always jack-centered-at-origin) jack,
@@ -234,6 +281,8 @@
     MATCH_MARGIN,
     MERGE_RADIUS,
     CONFIRM_OBSERVATIONS,
+    MISS_THRESHOLD,
+    OBSERVED_REGION_RADIUS,
     createFusion,
     addFrame,
     getSnapshot,

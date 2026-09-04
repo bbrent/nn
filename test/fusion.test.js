@@ -31,6 +31,16 @@ function makeFrame(visibleIndices, theta) {
   return { usable: true, jack: { x: 0, y: 0 }, ranking };
 }
 
+// Like makeFrame, but for an arbitrary point set — used by the pruning cases
+// below, which need geometry closer together than WORLD_BOWLS provides.
+function makeFrameFrom(points, visibleIndices, theta) {
+  const ranking = visibleIndices.map(i => {
+    const p = rotate(points[i], theta);
+    return { bowl: { i }, dist: Math.hypot(p.x, p.y), localX: p.x, localY: p.y };
+  });
+  return { usable: true, jack: { x: 0, y: 0 }, ranking };
+}
+
 function approxEqual(a, b, tol) {
   return Math.abs(a - b) < tol;
 }
@@ -163,7 +173,44 @@ function run() {
     }
   }
 
-  return { name: 'fusion', total: 5, failures };
+  // Case 6: a landmark that's genuinely gone (a false positive that isn't
+  // there on re-look, or literally removed from the rink) should be pruned
+  // once frames that clearly re-check its neighborhood keep coming up empty.
+  {
+    const CLOSE_PTS = [
+      { x: 1.0, y: 0.0 }, // A
+      { x: 1.3, y: 0.3 }, // B
+      { x: 0.7, y: -0.3 }, // C — "goes missing" after seeding
+    ];
+    const fusion = LawnBowlsFusion.createFusion();
+    for (let i = 0; i < 3; i++) LawnBowlsFusion.addFrame(fusion, makeFrameFrom(CLOSE_PTS, [0, 1, 2], i * 0.15));
+    if (fusion.bowls.length !== 3) failures.push(`case6: expected 3 seeded landmarks, got ${fusion.bowls.length}`);
+
+    let sawRemoval = false;
+    for (let i = 0; i < LawnBowlsFusion.MISS_THRESHOLD; i++) {
+      const r = LawnBowlsFusion.addFrame(fusion, makeFrameFrom(CLOSE_PTS, [0, 1], 0.4 + i * 0.1));
+      if (r.removedLandmarks > 0) sawRemoval = true;
+    }
+    if (!sawRemoval) failures.push('case6: landmark C should have been pruned after repeated clean misses');
+    if (fusion.bowls.length !== 2) failures.push(`case6: expected 2 landmarks left after pruning, got ${fusion.bowls.length}`);
+    if (fusion.bowls.some(b => Math.hypot(b.x - 0.7, b.y - (-0.3)) < 0.3)) {
+      failures.push('case6: pruned landmark C is still present');
+    }
+  }
+
+  // Case 7: a landmark that's just genuinely out of frame (far from anything
+  // this frame re-confirmed) must NOT be pruned — only a spot the camera
+  // clearly just re-checked counts as evidence of absence.
+  {
+    const fusion = LawnBowlsFusion.createFusion();
+    for (let i = 0; i < 3; i++) LawnBowlsFusion.addFrame(fusion, makeFrame([0, 2, 3], i * 0.2));
+    for (let i = 0; i < 3; i++) LawnBowlsFusion.addFrame(fusion, makeFrame([0, 3], 0.5 + i * 0.15));
+    if (fusion.bowls.length !== 3) {
+      failures.push(`case7: bowl 2 (out of frame, not absent) should not have been pruned, got ${fusion.bowls.length} landmarks`);
+    }
+  }
+
+  return { name: 'fusion', total: 7, failures };
 }
 
 module.exports = { run };
