@@ -129,7 +129,7 @@ async function main() {
   let totalCount = 0;
   let failCount = 0;
 
-  for (const mod of ['./score.test.js', './fusion.test.js']) {
+  for (const mod of ['./score.test.js', './fusion.test.js', './yolo.test.js']) {
     const result = require(mod).run();
     totalCount += result.total;
     if (result.failures.length === 0) {

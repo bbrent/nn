@@ -1,5 +1,11 @@
-// Detection logic lives in detection.js, cross-frame fusion in fusion.js
-// (both shared with the Node test harness).
+// Detection is now YOLOv8n (yolo-detector.js) run via onnxruntime-web,
+// replacing the old Hough-based detection.js circle finder — real turf
+// texture flooded Hough with 80-190 spurious "circles" per photo (see
+// test/fixtures/real/), while YOLO reliably finds real bowls even at low
+// confidence, filtered to sports-ball/bowl classes. computeScore is still
+// shared from detection.js (pure ranking-list logic, detector-agnostic);
+// fusion.js needed zero changes at all, since it only ever depended on the
+// {jack, bowls, ranking, usable} shape, not on how it was produced.
 
 // Surface any uncaught error on-screen instead of failing silently — this is
 // the only way to see what went wrong on a phone with no console attached.
@@ -10,24 +16,21 @@ window.addEventListener('error', e => {
   if (el) el.textContent = 'Script error: ' + e.message;
 });
 
-let cvReady = false;
+const MODEL_URL = './models/yolov8n.onnx';
+
+let cameraReady = false;
+let modelReady = false;
 let domReady = false;
 let scanning = false;
 let rafId = null;
+let session = null;
 
 let fusion = LawnBowlsFusion.createFusion(); // accumulated map, fed every usable frame while scanning
 let frozen = null; // { detections, jack, ranking } laid out from the fused map on Stop, for tap-to-assign
 let assignments = []; // parallel to frozen.ranking: 'mine' | 'theirs' | null
 
 let video, overlay, overlayCtx, statusEl, rankingEl, scanBtn;
-let captureCanvas, captureCtx; // offscreen: cv.imread() needs a canvas/img, not a <video>, as its source
-
-function onOpenCvReady() {
-  cv['onRuntimeInitialized'] = () => {
-    cvReady = true;
-    maybeStart();
-  };
-}
+let letterboxCanvas, letterboxCtx; // offscreen 640x640: YOLO's fixed input size
 
 document.addEventListener('DOMContentLoaded', () => {
   video = document.getElementById('video');
@@ -36,19 +39,36 @@ document.addEventListener('DOMContentLoaded', () => {
   statusEl = document.getElementById('status');
   rankingEl = document.getElementById('ranking');
   scanBtn = document.getElementById('scanBtn');
-  captureCanvas = document.createElement('canvas');
-  captureCtx = captureCanvas.getContext('2d', { willReadFrequently: true });
+  letterboxCanvas = document.createElement('canvas');
+  letterboxCanvas.width = LawnBowlsYolo.INPUT_SIZE;
+  letterboxCanvas.height = LawnBowlsYolo.INPUT_SIZE;
+  letterboxCtx = letterboxCanvas.getContext('2d', { willReadFrequently: true });
 
   scanBtn.addEventListener('click', toggleScan);
   overlay.addEventListener('click', handleCanvasTap);
   window.addEventListener('resize', sizeOverlay);
 
   domReady = true;
-  maybeStart();
+  startCamera();
+  loadModel();
 });
 
-function maybeStart() {
-  if (cvReady && domReady) startCamera();
+function maybeEnableScan() {
+  if (cameraReady && modelReady) {
+    setStatus('Hold the phone over the rink and tap Start Scan.');
+    scanBtn.disabled = false;
+  }
+}
+
+async function loadModel() {
+  try {
+    setStatus('Loading detection model…');
+    session = await ort.InferenceSession.create(MODEL_URL, { executionProviders: ['wasm'] });
+    modelReady = true;
+    maybeEnableScan();
+  } catch (err) {
+    setStatus('Model load error: ' + err.message);
+  }
 }
 
 async function startCamera() {
@@ -61,8 +81,8 @@ async function startCamera() {
     video.srcObject = stream;
     await video.play();
     sizeOverlay();
-    setStatus('Hold the phone over the rink and tap Start Scan.');
-    scanBtn.disabled = false;
+    cameraReady = true;
+    maybeEnableScan();
   } catch (err) {
     setStatus('Camera error: ' + err.message);
   }
@@ -72,8 +92,6 @@ function sizeOverlay() {
   if (!video.videoWidth) return;
   overlay.width = video.videoWidth;
   overlay.height = video.videoHeight;
-  captureCanvas.width = video.videoWidth;
-  captureCanvas.height = video.videoHeight;
 }
 
 function setStatus(msg) {
@@ -89,7 +107,7 @@ function toggleScan() {
 
     // Lay out the fused map (not just the last frame) so bowls seen anywhere
     // during the pan — even if out of frame now — have stable positions to tap.
-    // confirmedOnly: a stray object Hough-detected once or twice (a shoe, a
+    // confirmedOnly: a stray object detected once or twice (a shoe, a
     // hand) shouldn't get permanently scored as a bowl just because it was
     // in frame briefly — only landmarks seen consistently make the cut.
     const snapshot = LawnBowlsFusion.getSnapshot(fusion, { confirmedOnly: true });
@@ -118,14 +136,21 @@ function toggleScan() {
   }
 }
 
-function processFrame() {
+// Self-paced rather than a fixed rAF rate: inference is much heavier than
+// Hough was, so the next frame is only requested once this one's detection
+// (including the await) has actually finished, instead of queuing overlapping
+// inference calls every screen refresh.
+async function processFrame() {
   if (!scanning) return;
 
   try {
-    captureCtx.drawImage(video, 0, 0, captureCanvas.width, captureCanvas.height);
-    const src = cv.imread(captureCanvas);
-    const result = LawnBowlsDetection.detectAndRank(cv, src);
-    src.delete();
+    const letterbox = LawnBowlsYolo.computeLetterbox(video.videoWidth, video.videoHeight, LawnBowlsYolo.INPUT_SIZE);
+    letterboxCtx.fillStyle = 'rgb(114,114,114)';
+    letterboxCtx.fillRect(0, 0, LawnBowlsYolo.INPUT_SIZE, LawnBowlsYolo.INPUT_SIZE);
+    letterboxCtx.drawImage(video, letterbox.padX, letterbox.padY, letterbox.newWidth, letterbox.newHeight);
+    const imageData640 = letterboxCtx.getImageData(0, 0, LawnBowlsYolo.INPUT_SIZE, LawnBowlsYolo.INPUT_SIZE);
+
+    const result = await LawnBowlsYolo.detectAndRank(ort, session, imageData640, letterbox);
 
     if (result.usable) LawnBowlsFusion.addFrame(fusion, result);
 
