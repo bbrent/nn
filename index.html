@@ -16,13 +16,19 @@
     <div id="status">Loading…</div>
     <div id="controls">
       <button id="scanBtn" disabled>Start Scan</button>
+      <button id="registerBtn" disabled>Register Player</button>
     </div>
     <ul id="ranking"></ul>
+
+    <h3>Registered players</h3>
+    <ul id="registry"></ul>
   </div>
 
   <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.29.0/dist/ort.min.js"></script>
   <script src="detection.js"></script>
   <script src="yolo-detector.js"></script>
+  <script src="embedding.js"></script>
+  <script src="registry.js"></script>
   <script src="fusion.js"></script>
   <script src="app.js"></script>
 </body>

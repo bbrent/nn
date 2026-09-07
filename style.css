@@ -41,6 +41,12 @@ html, body {
   margin-bottom: 8px;
 }
 
+#controls {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
 #controls button {
   font-size: 16px;
   padding: 10px 20px;
@@ -50,9 +56,19 @@ html, body {
   color: white;
 }
 
+#registerBtn {
+  background: #1565c0;
+}
+
 #controls button:disabled {
   background: #444;
   color: #888;
+}
+
+#hud h3 {
+  font-size: 14px;
+  opacity: 0.7;
+  margin: 16px 0 6px;
 }
 
 #ranking {
@@ -73,4 +89,31 @@ html, body {
 #ranking li.jack {
   background: #4a3b00;
   font-weight: bold;
+}
+
+#registry {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+#registry li {
+  padding: 6px 10px;
+  margin-bottom: 6px;
+  border-radius: 6px;
+  background: #1e1e1e;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 13px;
+}
+
+#registry li button {
+  background: none;
+  border: none;
+  color: #ef5350;
+  font-size: 16px;
+  line-height: 1;
+  padding: 2px 6px;
+  cursor: pointer;
 }

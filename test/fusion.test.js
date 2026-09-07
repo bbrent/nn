@@ -23,10 +23,18 @@ function rotate(p, theta) {
 
 // Builds a synthetic usable detectAndRank()-shaped result: `visibleIndices`
 // of WORLD_BOWLS, as seen by a camera at orientation `theta` relative to world.
-function makeFrame(visibleIndices, theta) {
+// identities: optional map of worldIndex -> identity object, attached to the
+// matching ranking entry (simulating a registry match made before addFrame).
+function makeFrame(visibleIndices, theta, identities) {
   const ranking = visibleIndices.map(i => {
     const p = rotate(WORLD_BOWLS[i], theta);
-    return { bowl: { worldIndex: i }, dist: Math.hypot(p.x, p.y), localX: p.x, localY: p.y };
+    return {
+      bowl: { worldIndex: i },
+      dist: Math.hypot(p.x, p.y),
+      localX: p.x,
+      localY: p.y,
+      identity: (identities && identities[i]) || null,
+    };
   });
   return { usable: true, jack: { x: 0, y: 0 }, ranking };
 }
@@ -210,7 +218,37 @@ function run() {
     }
   }
 
-  return { name: 'fusion', total: 7, failures };
+  // Case 8: identity attached to a detection (a registry match made before
+  // addFrame) sticks to its landmark across merges, and a higher-similarity
+  // later match overrides a weaker earlier one — but a later frame with no
+  // identity at all must not erase what's already known.
+  {
+    const fusion = LawnBowlsFusion.createFusion();
+    const weakMatch = { playerId: 'p1', name: 'Alice', team: 'mine', similarity: 0.8 };
+    const strongMatch = { playerId: 'p1', name: 'Alice', team: 'mine', similarity: 0.95 };
+
+    LawnBowlsFusion.addFrame(fusion, makeFrame([0, 1, 2], 0, { 0: weakMatch }));
+    let bowl0 = fusion.bowls.find(b => Math.hypot(b.x - 1, b.y - 0) < 0.2);
+    if (!bowl0 || !bowl0.identity || bowl0.identity.name !== 'Alice') {
+      failures.push(`case8: expected bowl 0 identified as Alice after first frame, got ${JSON.stringify(bowl0 && bowl0.identity)}`);
+    }
+
+    // Stronger match on a later frame should override.
+    LawnBowlsFusion.addFrame(fusion, makeFrame([0, 1, 2], 0.3, { 0: strongMatch }));
+    bowl0 = fusion.bowls.find(b => Math.hypot(b.x - 1, b.y - 0) < 0.2);
+    if (!bowl0 || bowl0.identity.similarity !== 0.95) {
+      failures.push(`case8: expected stronger match (0.95) to override, got ${JSON.stringify(bowl0 && bowl0.identity)}`);
+    }
+
+    // A later frame with no identity at all must not erase the known one.
+    LawnBowlsFusion.addFrame(fusion, makeFrame([0, 1, 2], 0.6));
+    bowl0 = fusion.bowls.find(b => Math.hypot(b.x - 1, b.y - 0) < 0.2);
+    if (!bowl0 || !bowl0.identity || bowl0.identity.name !== 'Alice') {
+      failures.push(`case8: identity should persist even when a later frame has none, got ${JSON.stringify(bowl0 && bowl0.identity)}`);
+    }
+  }
+
+  return { name: 'fusion', total: 8, failures };
 }
 
 module.exports = { run };

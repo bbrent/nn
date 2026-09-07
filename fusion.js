@@ -137,11 +137,17 @@
     fusion.frameCount++;
     fusion.jackSeen++;
 
-    const localPoints = frameResult.ranking.map(r => ({ x: r.localX, y: r.localY }));
+    // identity (optional): { playerId, name, team, similarity } from matching
+    // this bowl's appearance embedding against the player registry, attached
+    // by the caller before calling addFrame. Carried onto the landmark as a
+    // "best confident match so far" — later, higher-similarity identities
+    // override earlier weaker ones, but a landmark never loses an identity
+    // just because one frame's crop didn't match as well.
+    const localPoints = frameResult.ranking.map(r => ({ x: r.localX, y: r.localY, identity: r.identity || null }));
 
     if (fusion.bowls.length === 0) {
       // First frame: its own orientation becomes the world frame.
-      for (const p of localPoints) fusion.bowls.push({ x: p.x, y: p.y, observations: 1, misses: 0 });
+      for (const p of localPoints) fusion.bowls.push({ x: p.x, y: p.y, observations: 1, misses: 0, identity: p.identity });
       return { merged: true, newLandmarks: localPoints.length, removedLandmarks: 0, reason: null };
     }
 
@@ -161,7 +167,10 @@
     let newLandmarks = 0;
     const seenIndices = new Set();
 
-    for (const rotated of rotatedPoints) {
+    for (let i = 0; i < rotatedPoints.length; i++) {
+      const rotated = rotatedPoints[i];
+      const identity = localPoints[i].identity;
+
       let bestIndex = -1;
       let bestDist = Infinity;
       fusion.bowls.forEach((w, j) => {
@@ -179,9 +188,12 @@
         landmark.y = (landmark.y * n + rotated.y) / (n + 1);
         landmark.observations = n + 1;
         landmark.misses = 0;
+        if (identity && (!landmark.identity || identity.similarity > landmark.identity.similarity)) {
+          landmark.identity = identity;
+        }
         seenIndices.add(bestIndex);
       } else {
-        fusion.bowls.push({ x: rotated.x, y: rotated.y, observations: 1, misses: 0 });
+        fusion.bowls.push({ x: rotated.x, y: rotated.y, observations: 1, misses: 0, identity });
         seenIndices.add(fusion.bowls.length - 1);
         newLandmarks++;
       }
@@ -256,16 +268,17 @@
     const centerX = (minX + maxX) / 2;
     const centerY = (minY + maxY) / 2;
 
-    function project(p, r) {
+    function project(p, r, identity) {
       return {
         x: width / 2 + (p.x - centerX) * scale,
         y: height / 2 + (p.y - centerY) * scale,
         r,
+        identity: identity || null,
       };
     }
 
     const jack = project({ x: 0, y: 0 }, jackR);
-    const bowlPoints = snapshot.bowls.map(b => project(b, bowlR));
+    const bowlPoints = snapshot.bowls.map(b => project(b, bowlR, b.identity));
     const detections = [jack, ...bowlPoints];
 
     const ranking = snapshot.ranking.map(entry => {

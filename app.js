@@ -16,21 +16,30 @@ window.addEventListener('error', e => {
   if (el) el.textContent = 'Script error: ' + e.message;
 });
 
-const MODEL_URL = './models/yolov8n.onnx';
+const YOLO_MODEL_URL = './models/yolov8n.onnx';
+const EMBEDDING_MODEL_URL = './models/mobilenetv2-embedding.onnx';
+const REGISTRY_STORAGE_KEY = 'lawnBowlsRegistry';
+const REGISTRATION_DURATION_MS = 6000;
+const REGISTRATION_VIEW_LIMIT = 12;
 
 let cameraReady = false;
 let modelReady = false;
 let domReady = false;
 let scanning = false;
+let registering = false;
 let rafId = null;
-let session = null;
+let yoloSession = null;
+let embeddingSession = null;
 
 let fusion = LawnBowlsFusion.createFusion(); // accumulated map, fed every usable frame while scanning
 let frozen = null; // { detections, jack, ranking } laid out from the fused map on Stop, for tap-to-assign
 let assignments = []; // parallel to frozen.ranking: 'mine' | 'theirs' | null
+let registry = LawnBowlsRegistry.createRegistry(); // player roster + appearance galleries, persisted in localStorage
 
-let video, overlay, overlayCtx, statusEl, rankingEl, scanBtn;
+let video, overlay, overlayCtx, statusEl, rankingEl, scanBtn, registerBtn, registryEl;
 let letterboxCanvas, letterboxCtx; // offscreen 640x640: YOLO's fixed input size
+let frameCanvas, frameCtx; // offscreen, native video resolution: source for bowl crops
+let cropCanvas, cropCtx; // offscreen 224x224: embedding model's fixed input size
 
 document.addEventListener('DOMContentLoaded', () => {
   video = document.getElementById('video');
@@ -39,35 +48,72 @@ document.addEventListener('DOMContentLoaded', () => {
   statusEl = document.getElementById('status');
   rankingEl = document.getElementById('ranking');
   scanBtn = document.getElementById('scanBtn');
+  registerBtn = document.getElementById('registerBtn');
+  registryEl = document.getElementById('registry');
+
   letterboxCanvas = document.createElement('canvas');
   letterboxCanvas.width = LawnBowlsYolo.INPUT_SIZE;
   letterboxCanvas.height = LawnBowlsYolo.INPUT_SIZE;
   letterboxCtx = letterboxCanvas.getContext('2d', { willReadFrequently: true });
 
+  frameCanvas = document.createElement('canvas');
+  frameCtx = frameCanvas.getContext('2d', { willReadFrequently: true });
+
+  cropCanvas = document.createElement('canvas');
+  cropCanvas.width = LawnBowlsEmbedding.INPUT_SIZE;
+  cropCanvas.height = LawnBowlsEmbedding.INPUT_SIZE;
+  cropCtx = cropCanvas.getContext('2d', { willReadFrequently: true });
+
+  loadRegistry();
+  renderRegistryList();
+
   scanBtn.addEventListener('click', toggleScan);
+  registerBtn.addEventListener('click', startRegistration);
   overlay.addEventListener('click', handleCanvasTap);
   window.addEventListener('resize', sizeOverlay);
 
   domReady = true;
   startCamera();
-  loadModel();
+  loadModels();
 });
 
 function maybeEnableScan() {
   if (cameraReady && modelReady) {
     setStatus('Hold the phone over the rink and tap Start Scan.');
     scanBtn.disabled = false;
+    registerBtn.disabled = false;
   }
 }
 
-async function loadModel() {
+async function loadModels() {
   try {
     setStatus('Loading detection model…');
-    session = await ort.InferenceSession.create(MODEL_URL, { executionProviders: ['wasm'] });
+    yoloSession = await ort.InferenceSession.create(YOLO_MODEL_URL, { executionProviders: ['wasm'] });
+    setStatus('Loading player-matching model…');
+    embeddingSession = await ort.InferenceSession.create(EMBEDDING_MODEL_URL, { executionProviders: ['wasm'] });
     modelReady = true;
     maybeEnableScan();
   } catch (err) {
     setStatus('Model load error: ' + err.message);
+  }
+}
+
+function loadRegistry() {
+  try {
+    const stored = localStorage.getItem(REGISTRY_STORAGE_KEY);
+    if (stored) registry = LawnBowlsRegistry.deserialize(stored);
+  } catch (err) {
+    // Corrupt/unavailable storage — start fresh rather than block the app.
+    registry = LawnBowlsRegistry.createRegistry();
+  }
+}
+
+function saveRegistry() {
+  try {
+    localStorage.setItem(REGISTRY_STORAGE_KEY, LawnBowlsRegistry.serialize(registry));
+  } catch (err) {
+    // Storage full/unavailable (private browsing, etc.) — registry still
+    // works for the rest of this session, just won't persist.
   }
 }
 
@@ -92,6 +138,30 @@ function sizeOverlay() {
   if (!video.videoWidth) return;
   overlay.width = video.videoWidth;
   overlay.height = video.videoHeight;
+  frameCanvas.width = video.videoWidth;
+  frameCanvas.height = video.videoHeight;
+}
+
+// Crops a square region around a detection (a bit larger than its radius,
+// for context) from a native-resolution source canvas, scaled to the
+// embedding model's fixed input size. Returns null if the detection is too
+// close to the frame edge to crop meaningfully.
+function cropBowlImageData(sourceCanvas, bowl) {
+  const side = bowl.r * 2.4;
+  let sx = bowl.x - side / 2;
+  let sy = bowl.y - side / 2;
+  let sw = side;
+  let sh = side;
+  if (sx < 0) { sw += sx; sx = 0; }
+  if (sy < 0) { sh += sy; sy = 0; }
+  if (sx + sw > sourceCanvas.width) sw = sourceCanvas.width - sx;
+  if (sy + sh > sourceCanvas.height) sh = sourceCanvas.height - sy;
+  if (sw <= 0 || sh <= 0) return null;
+
+  const size = LawnBowlsEmbedding.INPUT_SIZE;
+  cropCtx.clearRect(0, 0, size, size);
+  cropCtx.drawImage(sourceCanvas, sx, sy, sw, sh, 0, 0, size, size);
+  return cropCtx.getImageData(0, 0, size, size);
 }
 
 function setStatus(msg) {
@@ -103,6 +173,7 @@ function toggleScan() {
     scanning = false;
     if (rafId) cancelAnimationFrame(rafId);
     scanBtn.textContent = 'Start Scan';
+    registerBtn.disabled = false;
     video.pause();
 
     // Lay out the fused map (not just the last frame) so bowls seen anywhere
@@ -113,8 +184,12 @@ function toggleScan() {
     const snapshot = LawnBowlsFusion.getSnapshot(fusion, { confirmedOnly: true });
     if (snapshot.bowls.length > 0) {
       frozen = LawnBowlsFusion.layoutForCanvas(snapshot, overlay.width, overlay.height);
-      assignments = new Array(frozen.ranking.length).fill(null);
-      setStatus(`Map built from ${fusion.frameCount} frame(s). Tap each flag, closest first, to mark it yours or theirs.`);
+      // Pre-fill from any confident registry match made live during the scan;
+      // anything unmatched stays null for the existing tap-to-assign fallback.
+      assignments = frozen.ranking.map(entry => (entry.bowl.identity ? entry.bowl.identity.team : null));
+      const matchedCount = assignments.filter(a => a !== null).length;
+      const matchedNote = matchedCount > 0 ? ` ${matchedCount} auto-matched from the registry.` : '';
+      setStatus(`Map built from ${fusion.frameCount} frame(s).${matchedNote} Tap any flag to set or correct whose it is.`);
       renderFrozen();
     } else {
       frozen = null;
@@ -130,6 +205,7 @@ function toggleScan() {
     fusion = LawnBowlsFusion.createFusion();
     rankingEl.innerHTML = '';
     scanBtn.textContent = 'Stop Scan';
+    registerBtn.disabled = true;
     setStatus('Scanning…');
     video.play();
     rafId = requestAnimationFrame(processFrame);
@@ -150,9 +226,20 @@ async function processFrame() {
     letterboxCtx.drawImage(video, letterbox.padX, letterbox.padY, letterbox.newWidth, letterbox.newHeight);
     const imageData640 = letterboxCtx.getImageData(0, 0, LawnBowlsYolo.INPUT_SIZE, LawnBowlsYolo.INPUT_SIZE);
 
-    const result = await LawnBowlsYolo.detectAndRank(ort, session, imageData640, letterbox);
+    const result = await LawnBowlsYolo.detectAndRank(ort, yoloSession, imageData640, letterbox);
 
-    if (result.usable) LawnBowlsFusion.addFrame(fusion, result);
+    if (result.usable) {
+      // Native-resolution frame to crop bowls from — the 640x640 letterboxed
+      // one is too downscaled for a clean embedding crop.
+      frameCtx.drawImage(video, 0, 0, frameCanvas.width, frameCanvas.height);
+      for (const entry of result.ranking) {
+        const crop = cropBowlImageData(frameCanvas, entry.bowl);
+        if (!crop) continue;
+        const embedding = await LawnBowlsEmbedding.embedCrop(ort, embeddingSession, crop);
+        entry.identity = LawnBowlsRegistry.matchBowl(registry, embedding);
+      }
+      LawnBowlsFusion.addFrame(fusion, result);
+    }
 
     drawOverlay(result.detections, result.jack, result.usable ? result.ranking : []);
     renderRanking(result.ranking, result.usable, result.reason, result.detections.length);
@@ -163,11 +250,104 @@ async function processFrame() {
   } catch (err) {
     scanning = false;
     scanBtn.textContent = 'Start Scan';
+    registerBtn.disabled = false;
     setStatus('Scan error: ' + err.message);
     return;
   }
 
   rafId = requestAnimationFrame(processFrame);
+}
+
+// --- Player registration: capture multiple views per player's bowls -------
+
+async function startRegistration() {
+  if (!modelReady || !cameraReady || scanning || registering) return;
+
+  const name = (prompt('Player name?') || '').trim();
+  if (!name) return;
+  const isMine = confirm("Is this player on your team?\nOK = mine, Cancel = the opponent's.");
+  const team = isMine ? 'mine' : 'theirs';
+
+  const playerId = LawnBowlsRegistry.addPlayer(registry, name, team);
+
+  registering = true;
+  scanBtn.disabled = true;
+  registerBtn.disabled = true;
+  video.play();
+
+  let viewCount = 0;
+  const stopAt = Date.now() + REGISTRATION_DURATION_MS;
+
+  try {
+    while (Date.now() < stopAt && viewCount < REGISTRATION_VIEW_LIMIT) {
+      const letterbox = LawnBowlsYolo.computeLetterbox(video.videoWidth, video.videoHeight, LawnBowlsYolo.INPUT_SIZE);
+      letterboxCtx.fillStyle = 'rgb(114,114,114)';
+      letterboxCtx.fillRect(0, 0, LawnBowlsYolo.INPUT_SIZE, LawnBowlsYolo.INPUT_SIZE);
+      letterboxCtx.drawImage(video, letterbox.padX, letterbox.padY, letterbox.newWidth, letterbox.newHeight);
+      const imageData640 = letterboxCtx.getImageData(0, 0, LawnBowlsYolo.INPUT_SIZE, LawnBowlsYolo.INPUT_SIZE);
+
+      // Registration doesn't need jack/bowl classification or ranking — any
+      // round object in view during this window is assumed to be this
+      // player's own bowl, shown deliberately.
+      const result = await LawnBowlsYolo.detectAndRank(ort, yoloSession, imageData640, letterbox);
+      frameCtx.drawImage(video, 0, 0, frameCanvas.width, frameCanvas.height);
+      drawOverlay(result.detections, null, []);
+
+      for (const d of result.detections) {
+        if (viewCount >= REGISTRATION_VIEW_LIMIT) break;
+        const crop = cropBowlImageData(frameCanvas, d);
+        if (!crop) continue;
+        const embedding = await LawnBowlsEmbedding.embedCrop(ort, embeddingSession, crop);
+        LawnBowlsRegistry.addGalleryView(registry, playerId, embedding);
+        viewCount++;
+      }
+
+      setStatus(`Registering ${name}… show their bowls, rotating a bit. ${viewCount} view(s) captured.`);
+      await new Promise(resolve => setTimeout(resolve, 400));
+    }
+  } catch (err) {
+    setStatus('Registration error: ' + err.message);
+  }
+
+  registering = false;
+  scanBtn.disabled = false;
+  registerBtn.disabled = false;
+  overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
+  saveRegistry();
+  renderRegistryList();
+
+  if (frozen) {
+    renderFrozen();
+  } else {
+    setStatus(`Registered ${name} (${team === 'mine' ? 'yours' : "opponent's"}) with ${viewCount} view(s). Hold the phone over the rink and tap Start Scan.`);
+  }
+}
+
+function renderRegistryList() {
+  registryEl.innerHTML = '';
+  if (registry.players.length === 0) {
+    const li = document.createElement('li');
+    li.textContent = 'No players registered yet.';
+    registryEl.appendChild(li);
+    return;
+  }
+
+  registry.players.forEach(player => {
+    const li = document.createElement('li');
+    const label = document.createElement('span');
+    label.textContent = `${player.name} (${player.team === 'mine' ? 'yours' : "opponent's"}) — ${player.gallery.length} view(s)`;
+    const removeBtn = document.createElement('button');
+    removeBtn.textContent = '×';
+    removeBtn.title = 'Remove player';
+    removeBtn.addEventListener('click', () => {
+      LawnBowlsRegistry.removePlayer(registry, player.id);
+      saveRegistry();
+      renderRegistryList();
+    });
+    li.appendChild(label);
+    li.appendChild(removeBtn);
+    registryEl.appendChild(li);
+  });
 }
 
 // Closest-to-farthest color scale for ranked bowls; unranked detections (jack
