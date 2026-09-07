@@ -24,6 +24,16 @@
     <ul id="registry"></ul>
   </div>
 
+  <div id="pickerModal" hidden>
+    <h3>Select this player's bowls</h3>
+    <p id="pickerHint">Point the camera at their bowls — new ones appear up top as they're seen.</p>
+    <div id="pickerGrid"></div>
+    <div id="pickerControls">
+      <button id="pickerConfirm">Confirm</button>
+      <button id="pickerCancel">Cancel</button>
+    </div>
+  </div>
+
   <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.29.0/dist/ort.min.js"></script>
   <script src="detection.js"></script>
   <script src="yolo-detector.js"></script>

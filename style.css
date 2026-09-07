@@ -117,3 +117,88 @@ html, body {
   padding: 2px 6px;
   cursor: pointer;
 }
+
+#pickerModal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.94);
+  z-index: 10;
+  padding: 16px;
+  overflow-y: auto;
+}
+
+#pickerModal[hidden] {
+  display: none;
+}
+
+#pickerModal h3 {
+  margin: 0 0 4px;
+}
+
+#pickerHint {
+  font-size: 13px;
+  opacity: 0.75;
+  margin: 0 0 12px;
+}
+
+#pickerGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(72px, 1fr));
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.pickerThumb {
+  position: relative;
+  border-radius: 8px;
+  overflow: hidden;
+  border: 3px solid transparent;
+  cursor: pointer;
+  background: #1e1e1e;
+}
+
+.pickerThumb img {
+  display: block;
+  width: 100%;
+  aspect-ratio: 1;
+  object-fit: cover;
+}
+
+.pickerThumb.selected {
+  border-color: #2e7d32;
+}
+
+.pickerThumb.selected::after {
+  content: '✓';
+  position: absolute;
+  top: 2px;
+  right: 4px;
+  color: #2e7d32;
+  font-weight: bold;
+  text-shadow: 0 0 3px #000;
+}
+
+#pickerControls {
+  display: flex;
+  gap: 10px;
+  position: sticky;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.94);
+  padding-top: 8px;
+}
+
+#pickerControls button {
+  font-size: 16px;
+  padding: 10px 20px;
+  border-radius: 8px;
+  border: none;
+  color: white;
+}
+
+#pickerConfirm {
+  background: #2e7d32;
+}
+
+#pickerCancel {
+  background: #555;
+}

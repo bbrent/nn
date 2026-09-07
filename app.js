@@ -19,14 +19,15 @@ window.addEventListener('error', e => {
 const YOLO_MODEL_URL = './models/yolov8n.onnx';
 const EMBEDDING_MODEL_URL = './models/mobilenetv2-embedding.onnx';
 const REGISTRY_STORAGE_KEY = 'lawnBowlsRegistry';
-const REGISTRATION_DURATION_MS = 6000;
-const REGISTRATION_VIEW_LIMIT = 12;
+const MAX_RECENT_OBSERVATIONS = 40; // how many recent bowl thumbnails the picker keeps
+const MAX_DETECTIONS_EMBEDDED_PER_FRAME = 15; // bound embedding cost on a noisy frame
+const THUMBNAIL_SIZE = 64;
 
 let cameraReady = false;
 let modelReady = false;
 let domReady = false;
 let scanning = false;
-let registering = false;
+let picking = false; // registration picker's live capture loop is running
 let rafId = null;
 let yoloSession = null;
 let embeddingSession = null;
@@ -35,8 +36,11 @@ let fusion = LawnBowlsFusion.createFusion(); // accumulated map, fed every usabl
 let frozen = null; // { detections, jack, ranking } laid out from the fused map on Stop, for tap-to-assign
 let assignments = []; // parallel to frozen.ranking: 'mine' | 'theirs' | null
 let registry = LawnBowlsRegistry.createRegistry(); // player roster + appearance galleries, persisted in localStorage
+let recentObservations = []; // newest first: { id, thumbnail (data URL), embedding } — feeds the registration picker
+let pickerSelection = new Set(); // observation ids currently selected in the open picker
 
 let video, overlay, overlayCtx, statusEl, rankingEl, scanBtn, registerBtn, registryEl;
+let pickerModal, pickerGrid, pickerConfirmBtn, pickerCancelBtn;
 let letterboxCanvas, letterboxCtx; // offscreen 640x640: YOLO's fixed input size
 let frameCanvas, frameCtx; // offscreen, native video resolution: source for bowl crops
 let cropCanvas, cropCtx; // offscreen 224x224: embedding model's fixed input size
@@ -50,6 +54,10 @@ document.addEventListener('DOMContentLoaded', () => {
   scanBtn = document.getElementById('scanBtn');
   registerBtn = document.getElementById('registerBtn');
   registryEl = document.getElementById('registry');
+  pickerModal = document.getElementById('pickerModal');
+  pickerGrid = document.getElementById('pickerGrid');
+  pickerConfirmBtn = document.getElementById('pickerConfirm');
+  pickerCancelBtn = document.getElementById('pickerCancel');
 
   letterboxCanvas = document.createElement('canvas');
   letterboxCanvas.width = LawnBowlsYolo.INPUT_SIZE;
@@ -68,7 +76,9 @@ document.addEventListener('DOMContentLoaded', () => {
   renderRegistryList();
 
   scanBtn.addEventListener('click', toggleScan);
-  registerBtn.addEventListener('click', startRegistration);
+  registerBtn.addEventListener('click', openRegistrationPicker);
+  pickerConfirmBtn.addEventListener('click', confirmPicker);
+  pickerCancelBtn.addEventListener('click', cancelPicker);
   overlay.addEventListener('click', handleCanvasTap);
   window.addEventListener('resize', sizeOverlay);
 
@@ -164,6 +174,31 @@ function cropBowlImageData(sourceCanvas, bowl) {
   return cropCtx.getImageData(0, 0, size, size);
 }
 
+// cropCanvas still holds whatever cropBowlImageData last drew onto it — reuse
+// it directly as the thumbnail source rather than re-decoding the ImageData.
+function makeThumbnailFromCropCanvas() {
+  const thumbCanvas = document.createElement('canvas');
+  thumbCanvas.width = THUMBNAIL_SIZE;
+  thumbCanvas.height = THUMBNAIL_SIZE;
+  thumbCanvas.getContext('2d').drawImage(cropCanvas, 0, 0, THUMBNAIL_SIZE, THUMBNAIL_SIZE);
+  return thumbCanvas.toDataURL('image/jpeg', 0.7);
+}
+
+// Records a just-embedded crop as a recent observation for the registration
+// picker (newest first, capped). Call right after cropBowlImageData so
+// cropCanvas still holds the matching crop.
+function recordObservation(embedding) {
+  recentObservations.unshift({
+    id: 'obs_' + Math.random().toString(36).slice(2, 10),
+    thumbnail: makeThumbnailFromCropCanvas(),
+    embedding,
+  });
+  if (recentObservations.length > MAX_RECENT_OBSERVATIONS) {
+    recentObservations.length = MAX_RECENT_OBSERVATIONS;
+  }
+  if (picking) renderPickerGrid();
+}
+
 function setStatus(msg) {
   statusEl.textContent = msg;
 }
@@ -228,15 +263,25 @@ async function processFrame() {
 
     const result = await LawnBowlsYolo.detectAndRank(ort, yoloSession, imageData640, letterbox);
 
+    // Native-resolution frame to crop bowls from — the 640x640 letterboxed
+    // one is too downscaled for a clean embedding crop. Embed every raw
+    // detection (capped) once, regardless of usable/ranked status — this
+    // also feeds the registration picker's "recently seen" thumbnails, not
+    // just registry matching for fusion.
+    frameCtx.drawImage(video, 0, 0, frameCanvas.width, frameCanvas.height);
+    const embeddingByDetection = new Map();
+    for (const d of result.detections.slice(0, MAX_DETECTIONS_EMBEDDED_PER_FRAME)) {
+      const crop = cropBowlImageData(frameCanvas, d);
+      if (!crop) continue;
+      const embedding = await LawnBowlsEmbedding.embedCrop(ort, embeddingSession, crop);
+      embeddingByDetection.set(d, embedding);
+      recordObservation(embedding);
+    }
+
     if (result.usable) {
-      // Native-resolution frame to crop bowls from — the 640x640 letterboxed
-      // one is too downscaled for a clean embedding crop.
-      frameCtx.drawImage(video, 0, 0, frameCanvas.width, frameCanvas.height);
       for (const entry of result.ranking) {
-        const crop = cropBowlImageData(frameCanvas, entry.bowl);
-        if (!crop) continue;
-        const embedding = await LawnBowlsEmbedding.embedCrop(ort, embeddingSession, crop);
-        entry.identity = LawnBowlsRegistry.matchBowl(registry, embedding);
+        const embedding = embeddingByDetection.get(entry.bowl);
+        entry.identity = embedding ? LawnBowlsRegistry.matchBowl(registry, embedding) : null;
       }
       LawnBowlsFusion.addFrame(fusion, result);
     }
@@ -258,10 +303,89 @@ async function processFrame() {
   rafId = requestAnimationFrame(processFrame);
 }
 
-// --- Player registration: capture multiple views per player's bowls -------
+// --- Player registration: pick from recently-seen bowls, then name them ---
 
-async function startRegistration() {
-  if (!modelReady || !cameraReady || scanning || registering) return;
+function openRegistrationPicker() {
+  if (!modelReady || !cameraReady || scanning || picking) return;
+
+  pickerSelection.clear();
+  picking = true;
+  scanBtn.disabled = true;
+  registerBtn.disabled = true;
+  pickerModal.hidden = false;
+  renderPickerGrid();
+  video.play();
+
+  pickerLoop();
+}
+
+// Runs until the picker is closed (Confirm/Cancel) — keeps detecting and
+// adding new thumbnails to the top of the grid (via recordObservation) so the
+// user can point the camera around and watch candidates appear, live, before
+// selecting any — rather than a blind timed capture with no visual check.
+async function pickerLoop() {
+  while (picking) {
+    try {
+      const letterbox = LawnBowlsYolo.computeLetterbox(video.videoWidth, video.videoHeight, LawnBowlsYolo.INPUT_SIZE);
+      letterboxCtx.fillStyle = 'rgb(114,114,114)';
+      letterboxCtx.fillRect(0, 0, LawnBowlsYolo.INPUT_SIZE, LawnBowlsYolo.INPUT_SIZE);
+      letterboxCtx.drawImage(video, letterbox.padX, letterbox.padY, letterbox.newWidth, letterbox.newHeight);
+      const imageData640 = letterboxCtx.getImageData(0, 0, LawnBowlsYolo.INPUT_SIZE, LawnBowlsYolo.INPUT_SIZE);
+
+      // No jack/bowl classification needed here — any round object seen
+      // while the picker is open is just a candidate to review and select.
+      const result = await LawnBowlsYolo.detectAndRank(ort, yoloSession, imageData640, letterbox);
+      frameCtx.drawImage(video, 0, 0, frameCanvas.width, frameCanvas.height);
+
+      for (const d of result.detections.slice(0, MAX_DETECTIONS_EMBEDDED_PER_FRAME)) {
+        const crop = cropBowlImageData(frameCanvas, d);
+        if (!crop) continue;
+        const embedding = await LawnBowlsEmbedding.embedCrop(ort, embeddingSession, crop);
+        recordObservation(embedding); // re-renders the grid itself while picking
+      }
+    } catch (err) {
+      setStatus('Registration error: ' + err.message);
+      break;
+    }
+    await new Promise(resolve => setTimeout(resolve, 400));
+  }
+}
+
+function renderPickerGrid() {
+  pickerGrid.innerHTML = '';
+  recentObservations.forEach(obs => {
+    const cell = document.createElement('div');
+    cell.className = 'pickerThumb' + (pickerSelection.has(obs.id) ? ' selected' : '');
+    const img = document.createElement('img');
+    img.src = obs.thumbnail;
+    cell.appendChild(img);
+    cell.addEventListener('click', () => {
+      if (pickerSelection.has(obs.id)) pickerSelection.delete(obs.id);
+      else pickerSelection.add(obs.id);
+      renderPickerGrid();
+    });
+    pickerGrid.appendChild(cell);
+  });
+}
+
+function closePicker() {
+  picking = false;
+  pickerModal.hidden = true;
+  scanBtn.disabled = false;
+  registerBtn.disabled = false;
+}
+
+function cancelPicker() {
+  closePicker();
+  if (frozen) renderFrozen();
+}
+
+function confirmPicker() {
+  const selected = recentObservations.filter(obs => pickerSelection.has(obs.id));
+  if (selected.length === 0) {
+    alert('Select at least one bowl first.');
+    return;
+  }
 
   const name = (prompt('Player name?') || '').trim();
   if (!name) return;
@@ -269,57 +393,15 @@ async function startRegistration() {
   const team = isMine ? 'mine' : 'theirs';
 
   const playerId = LawnBowlsRegistry.addPlayer(registry, name, team);
-
-  registering = true;
-  scanBtn.disabled = true;
-  registerBtn.disabled = true;
-  video.play();
-
-  let viewCount = 0;
-  const stopAt = Date.now() + REGISTRATION_DURATION_MS;
-
-  try {
-    while (Date.now() < stopAt && viewCount < REGISTRATION_VIEW_LIMIT) {
-      const letterbox = LawnBowlsYolo.computeLetterbox(video.videoWidth, video.videoHeight, LawnBowlsYolo.INPUT_SIZE);
-      letterboxCtx.fillStyle = 'rgb(114,114,114)';
-      letterboxCtx.fillRect(0, 0, LawnBowlsYolo.INPUT_SIZE, LawnBowlsYolo.INPUT_SIZE);
-      letterboxCtx.drawImage(video, letterbox.padX, letterbox.padY, letterbox.newWidth, letterbox.newHeight);
-      const imageData640 = letterboxCtx.getImageData(0, 0, LawnBowlsYolo.INPUT_SIZE, LawnBowlsYolo.INPUT_SIZE);
-
-      // Registration doesn't need jack/bowl classification or ranking — any
-      // round object in view during this window is assumed to be this
-      // player's own bowl, shown deliberately.
-      const result = await LawnBowlsYolo.detectAndRank(ort, yoloSession, imageData640, letterbox);
-      frameCtx.drawImage(video, 0, 0, frameCanvas.width, frameCanvas.height);
-      drawOverlay(result.detections, null, []);
-
-      for (const d of result.detections) {
-        if (viewCount >= REGISTRATION_VIEW_LIMIT) break;
-        const crop = cropBowlImageData(frameCanvas, d);
-        if (!crop) continue;
-        const embedding = await LawnBowlsEmbedding.embedCrop(ort, embeddingSession, crop);
-        LawnBowlsRegistry.addGalleryView(registry, playerId, embedding);
-        viewCount++;
-      }
-
-      setStatus(`Registering ${name}… show their bowls, rotating a bit. ${viewCount} view(s) captured.`);
-      await new Promise(resolve => setTimeout(resolve, 400));
-    }
-  } catch (err) {
-    setStatus('Registration error: ' + err.message);
-  }
-
-  registering = false;
-  scanBtn.disabled = false;
-  registerBtn.disabled = false;
-  overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
+  selected.forEach(obs => LawnBowlsRegistry.addGalleryView(registry, playerId, obs.embedding));
   saveRegistry();
   renderRegistryList();
 
+  closePicker();
   if (frozen) {
     renderFrozen();
   } else {
-    setStatus(`Registered ${name} (${team === 'mine' ? 'yours' : "opponent's"}) with ${viewCount} view(s). Hold the phone over the rink and tap Start Scan.`);
+    setStatus(`Registered ${name} (${team === 'mine' ? 'yours' : "opponent's"}) with ${selected.length} view(s). Hold the phone over the rink and tap Start Scan.`);
   }
 }
 
