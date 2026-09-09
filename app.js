@@ -89,9 +89,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
 function maybeEnableScan() {
   if (cameraReady && modelReady) {
-    setStatus('Hold the phone over the rink and tap Start Scan.');
-    scanBtn.disabled = false;
+    setStatus('Scanning… point the camera at the bowls.');
     registerBtn.disabled = false;
+    // Auto-start scanning instead of waiting for user to click
+    if (!scanning && !frozen) {
+      toggleScan();
+    }
   }
 }
 
@@ -207,7 +210,7 @@ function toggleScan() {
   if (scanning) {
     scanning = false;
     if (rafId) cancelAnimationFrame(rafId);
-    scanBtn.textContent = 'Start Scan';
+    scanBtn.hidden = true;
     registerBtn.disabled = false;
     video.pause();
 
@@ -224,7 +227,7 @@ function toggleScan() {
       assignments = frozen.ranking.map(entry => (entry.bowl.identity ? entry.bowl.identity.team : null));
       const matchedCount = assignments.filter(a => a !== null).length;
       const matchedNote = matchedCount > 0 ? ` ${matchedCount} auto-matched from the registry.` : '';
-      setStatus(`Map built from ${fusion.frameCount} frame(s).${matchedNote} Tap any flag to set or correct whose it is.`);
+      setStatus(`Map built from ${fusion.frameCount} frame(s).${matchedNote} Tap any dashed outline to assign a team.`);
       renderFrozen();
     } else {
       frozen = null;
@@ -239,9 +242,10 @@ function toggleScan() {
     assignments = [];
     fusion = LawnBowlsFusion.createFusion();
     rankingEl.innerHTML = '';
+    scanBtn.hidden = false;
     scanBtn.textContent = 'Stop Scan';
     registerBtn.disabled = true;
-    setStatus('Scanning…');
+    setStatus('Scanning… point the camera at the bowls.');
     video.play();
     rafId = requestAnimationFrame(processFrame);
   }
@@ -445,16 +449,20 @@ function drawOverlay(detections, jack, ranking) {
     const isJack = d === jack;
     const rankIndex = ranking.findIndex(entry => entry.bowl === d);
     const color = isJack ? JACK_COLOR : rankIndex >= 0 ? RANK_COLORS[Math.min(rankIndex, RANK_COLORS.length - 1)] : UNRANKED_COLOR;
-    drawAura(d, color, isJack);
+    // Use confidence for opacity fade — low confidence bowls appear ghosted
+    const opacity = isJack ? 1.0 : (d.conf || 0.5);
+    drawAura(d, color, isJack, opacity);
   }
 
   ranking.forEach((entry, i) => drawFlag(entry.bowl, i + 1, i === 0 ? '#2e7d32' : '#1565c0'));
 }
 
-function drawAura(d, color, isJack) {
+function drawAura(d, color, isJack, opacity, isDashed) {
+  opacity = opacity !== undefined ? opacity : 1.0;
+
   const glowR = d.r * 2.2;
   const gradient = overlayCtx.createRadialGradient(d.x, d.y, d.r * 0.6, d.x, d.y, glowR);
-  gradient.addColorStop(0, hexToRgba(color, 0.5));
+  gradient.addColorStop(0, hexToRgba(color, 0.5 * opacity));
   gradient.addColorStop(1, hexToRgba(color, 0));
   overlayCtx.fillStyle = gradient;
   overlayCtx.beginPath();
@@ -465,7 +473,13 @@ function drawAura(d, color, isJack) {
   overlayCtx.arc(d.x, d.y, d.r, 0, 2 * Math.PI);
   overlayCtx.strokeStyle = color;
   overlayCtx.lineWidth = isJack ? 3 : 2.5;
+  if (isDashed) {
+    overlayCtx.setLineDash([6, 4]);
+  }
+  overlayCtx.globalAlpha = opacity;
   overlayCtx.stroke();
+  overlayCtx.setLineDash([]);
+  overlayCtx.globalAlpha = 1.0;
 }
 
 function hexToRgba(hex, alpha) {
@@ -543,7 +557,9 @@ function renderFrozen() {
     const isJack = d === frozen.jack;
     const rankIndex = frozen.ranking.findIndex(entry => entry.bowl === d);
     const color = isJack ? JACK_COLOR : rankIndex >= 0 ? RANK_COLORS[Math.min(rankIndex, RANK_COLORS.length - 1)] : UNRANKED_COLOR;
-    drawAura(d, color, isJack);
+    // Dashed outline for unassigned bowls, solid for assigned
+    const isUnassigned = rankIndex >= 0 && assignments[rankIndex] === null;
+    drawAura(d, color, isJack, 1.0, isUnassigned);
   }
 
   frozen.ranking.forEach((entry, i) => {
@@ -616,7 +632,20 @@ function handleCanvasTap(evt) {
     }
   });
 
-  if (bestIndex >= 0) cycleAssignment(bestIndex);
+  if (bestIndex >= 0) {
+    // Unassigned bowl: prompt for team; assigned: cycle to change
+    if (assignments[bestIndex] === null) {
+      promptTeamAssignment(bestIndex);
+    } else {
+      cycleAssignment(bestIndex);
+    }
+  }
+}
+
+function promptTeamAssignment(i) {
+  const isYours = confirm('Is this bowl yours (red)? OK=yours, Cancel=opponent\'s (blue).');
+  assignments[i] = isYours ? 'mine' : 'theirs';
+  renderFrozen();
 }
 
 // Maps a click's CSS-pixel position to the canvas's internal pixel space,
