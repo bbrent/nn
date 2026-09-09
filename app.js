@@ -290,10 +290,11 @@ async function processFrame() {
       LawnBowlsFusion.addFrame(fusion, result);
     }
 
-    drawOverlay(result.detections, result.jack, result.usable ? result.ranking : []);
+    const mapSnapshot = LawnBowlsFusion.getSnapshot(fusion);
+    // Draw current detections + ghost outlines for tracked bowls not detected this frame
+    drawOverlay(result.detections, result.jack, result.usable ? result.ranking : [], mapSnapshot);
     renderRanking(result.ranking, result.usable, result.reason, result.detections.length);
 
-    const mapSnapshot = LawnBowlsFusion.getSnapshot(fusion);
     const confirmedCount = mapSnapshot.ranking.filter(r => r.confirmed).length;
     setStatus(`Scanning… ${mapSnapshot.bowls.length} bowl(s) tracked, ${confirmedCount} confirmed. Stop when ready.`);
   } catch (err) {
@@ -442,9 +443,21 @@ const RANK_COLORS = ['#66bb6a', '#9ccc65', '#ffee58', '#ffb74d', '#ef5350'];
 const JACK_COLOR = '#ffd54f';
 const UNRANKED_COLOR = '#42a5f5';
 
-function drawOverlay(detections, jack, ranking) {
+function drawOverlay(detections, jack, ranking, mapSnapshot) {
   overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
 
+  // Draw ghost outlines for tracked bowls not currently detected (light, low opacity)
+  if (mapSnapshot) {
+    for (const bowl of mapSnapshot.bowls) {
+      // Skip if this bowl was detected in this frame
+      if (detections.some(d => d === bowl)) continue;
+      const color = UNRANKED_COLOR;
+      // Very faint ghost: 0.2 opacity, no glow, dashed outline
+      drawAura(bowl, color, false, 0.2, true);
+    }
+  }
+
+  // Draw current detections with full confidence
   for (const d of detections) {
     const isJack = d === jack;
     const rankIndex = ranking.findIndex(entry => entry.bowl === d);
