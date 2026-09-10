@@ -1,11 +1,15 @@
-// Detection is now YOLOv8n (yolo-detector.js) run via onnxruntime-web,
-// replacing the old Hough-based detection.js circle finder — real turf
-// texture flooded Hough with 80-190 spurious "circles" per photo (see
-// test/fixtures/real/), while YOLO reliably finds real bowls even at low
-// confidence, filtered to sports-ball/bowl classes. computeScore is still
-// shared from detection.js (pure ranking-list logic, detector-agnostic);
-// fusion.js needed zero changes at all, since it only ever depended on the
-// {jack, bowls, ranking, usable} shape, not on how it was produced.
+// Detection is YOLOv8n (yolo-detector.js) run via onnxruntime-web, replacing
+// the old Hough-based detection.js circle finder — real turf texture flooded
+// Hough with 80-190 spurious "circles" per photo (see test/fixtures/real/),
+// while YOLO reliably finds real bowls even at low confidence, filtered to
+// sports-ball/bowl classes. computeScore is still shared from detection.js
+// (pure ranking-list logic, detector-agnostic).
+//
+// Mapping is slam.js, which estimates the camera's pose for every frame and
+// merges them all into one map. It replaces fusion.js, whose jack-anchored
+// alignment required the jack to be visible in every single frame — the
+// reason a real scan mostly came back blank. Now the jack only has to be seen
+// once, and only because the score is measured from it.
 
 // Surface any uncaught error on-screen instead of failing silently — this is
 // the only way to see what went wrong on a phone with no console attached.
@@ -32,12 +36,13 @@ let rafId = null;
 let yoloSession = null;
 let embeddingSession = null;
 
-let fusion = LawnBowlsFusion.createFusion(); // accumulated map, fed every usable frame while scanning
-let frozen = null; // { detections, jack, ranking } laid out from the fused map on Stop, for tap-to-assign
+let slam = LawnBowlsSlam.createSlam(); // shared map + camera pose, fed every frame while scanning
+let frozen = null; // { detections, jack, ranking } laid out from the map on Stop, for tap-to-assign
 let assignments = []; // parallel to frozen.ranking: 'mine' | 'theirs' | null
 let registry = LawnBowlsRegistry.createRegistry(); // player roster + appearance galleries, persisted in localStorage
 let recentObservations = []; // newest first: { id, thumbnail (data URL), embedding } — feeds the registration picker
 let pickerSelection = new Set(); // observation ids currently selected in the open picker
+let resumeScanAfterPicker = false; // the picker interrupted a live scan; restart it on close
 
 let video, overlay, overlayCtx, statusEl, rankingEl, scanBtn, registerBtn, registryEl;
 let pickerModal, pickerGrid, pickerConfirmBtn, pickerCancelBtn;
@@ -210,37 +215,43 @@ function toggleScan() {
   if (scanning) {
     scanning = false;
     if (rafId) cancelAnimationFrame(rafId);
-    scanBtn.hidden = true;
+    scanBtn.textContent = 'New Scan';
     registerBtn.disabled = false;
     video.pause();
 
-    // Lay out the fused map (not just the last frame) so bowls seen anywhere
-    // during the pan — even if out of frame now — have stable positions to tap.
-    // confirmedOnly: a stray object detected once or twice (a shoe, a
+    // Lay out the whole map (not just the last frame) so bowls seen anywhere
+    // during the scan — even ones long out of shot — have stable positions to
+    // tap. confirmedOnly: a stray object detected once or twice (a shoe, a
     // hand) shouldn't get permanently scored as a bowl just because it was
     // in frame briefly — only landmarks seen consistently make the cut.
-    const snapshot = LawnBowlsFusion.getSnapshot(fusion, { confirmedOnly: true });
-    if (snapshot.bowls.length > 0) {
-      frozen = LawnBowlsFusion.layoutForCanvas(snapshot, overlay.width, overlay.height);
+    const snapshot = LawnBowlsSlam.getSnapshot(slam, { confirmedOnly: true });
+    if (!snapshot.usable) {
+      frozen = null;
+      assignments = [];
+      overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
+      rankingEl.innerHTML = '';
+      setStatus(snapshot.reason + '. Start again and take one look at the jack.');
+    } else if (snapshot.bowls.length > 0) {
+      frozen = LawnBowlsSlam.layoutForCanvas(snapshot, overlay.width, overlay.height);
       // Pre-fill from any confident registry match made live during the scan;
       // anything unmatched stays null for the existing tap-to-assign fallback.
       assignments = frozen.ranking.map(entry => (entry.bowl.identity ? entry.bowl.identity.team : null));
       const matchedCount = assignments.filter(a => a !== null).length;
       const matchedNote = matchedCount > 0 ? ` ${matchedCount} auto-matched from the registry.` : '';
-      setStatus(`Map built from ${fusion.frameCount} frame(s).${matchedNote} Tap any dashed outline to assign a team.`);
+      setStatus(`Map built from ${snapshot.mergedCount} of ${snapshot.frameCount} frame(s).${matchedNote} Tap any dashed outline to assign a team.`);
       renderFrozen();
     } else {
       frozen = null;
       assignments = [];
       overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
       rankingEl.innerHTML = '';
-      setStatus('No bowl was seen consistently enough to trust — rescan and hold steadier over each one.');
+      setStatus('No bowl was seen consistently enough to trust — rescan and move a little slower over each one.');
     }
   } else {
     scanning = true;
     frozen = null;
     assignments = [];
-    fusion = LawnBowlsFusion.createFusion();
+    slam = LawnBowlsSlam.createSlam();
     rankingEl.innerHTML = '';
     scanBtn.hidden = false;
     scanBtn.textContent = 'Stop Scan';
@@ -269,37 +280,45 @@ async function processFrame() {
 
     // Native-resolution frame to crop bowls from — the 640x640 letterboxed
     // one is too downscaled for a clean embedding crop. Embed every raw
-    // detection (capped) once, regardless of usable/ranked status — this
-    // also feeds the registration picker's "recently seen" thumbnails, not
-    // just registry matching for fusion.
+    // detection (capped) once: this both feeds the registration picker's
+    // "recently seen" thumbnails and attaches each bowl's player identity
+    // for the map to carry.
     frameCtx.drawImage(video, 0, 0, frameCanvas.width, frameCanvas.height);
-    const embeddingByDetection = new Map();
     for (const d of result.detections.slice(0, MAX_DETECTIONS_EMBEDDED_PER_FRAME)) {
       const crop = cropBowlImageData(frameCanvas, d);
       if (!crop) continue;
       const embedding = await LawnBowlsEmbedding.embedCrop(ort, embeddingSession, crop);
-      embeddingByDetection.set(d, embedding);
+      d.identity = LawnBowlsRegistry.matchBowl(registry, embedding);
       recordObservation(embedding);
     }
 
-    if (result.usable) {
-      for (const entry of result.ranking) {
-        const embedding = embeddingByDetection.get(entry.bowl);
-        entry.identity = embedding ? LawnBowlsRegistry.matchBowl(registry, embedding) : null;
-      }
-      LawnBowlsFusion.addFrame(fusion, result);
-    }
+    // Every frame goes into the map, including ones with no jack in shot and
+    // ones the single-frame classifier called unusable — placing a view only
+    // needs bowls it shares with what's already mapped. The jack is only
+    // offered when this frame's own classification actually trusts it, so a
+    // frame that guessed at a jack it couldn't really see can't cast a vote.
+    const slamResult = LawnBowlsSlam.addFrame(slam, {
+      detections: result.detections,
+      jack: result.usable ? result.jack : null,
+      width: video.videoWidth,
+      height: video.videoHeight,
+    });
 
-    const mapSnapshot = LawnBowlsFusion.getSnapshot(fusion);
-    // Draw current detections + ghost outlines for tracked bowls not detected this frame
-    drawOverlay(result.detections, result.jack, result.usable ? result.ranking : [], mapSnapshot);
-    renderRanking(result.ranking, result.usable, result.reason, result.detections.length);
+    // Bowls the map knows about, projected back into this frame's view — so a
+    // bowl the detector missed this moment still shows where it is, instead of
+    // blinking out and looking like tracking has failed.
+    const ghosts = slamResult.merged
+      ? LawnBowlsSlam.projectToFrame(slam, slamResult.pose, slamResult.bowlDiameterPx)
+      : [];
 
-    const confirmedCount = mapSnapshot.ranking.filter(r => r.confirmed).length;
-    setStatus(`Scanning… ${mapSnapshot.bowls.length} bowl(s) tracked, ${confirmedCount} confirmed. Stop when ready.`);
+    drawOverlay(result.detections, result.jack, result.usable ? result.ranking : [], ghosts);
+
+    const mapSnapshot = LawnBowlsSlam.getSnapshot(slam);
+    renderTrackingList(mapSnapshot, result.detections.length);
+    setStatus(trackingStatus(slamResult, mapSnapshot));
   } catch (err) {
     scanning = false;
-    scanBtn.textContent = 'Start Scan';
+    scanBtn.textContent = 'New Scan';
     registerBtn.disabled = false;
     setStatus('Scan error: ' + err.message);
     return;
@@ -310,12 +329,22 @@ async function processFrame() {
 
 // --- Player registration: pick from recently-seen bowls, then name them ---
 
+// Scanning runs from the moment the camera is ready, so registering a player
+// has to interrupt it rather than wait for it to be idle. The map is left
+// alone while the picker is open and the scan picks up where it left off —
+// stopping to name a player shouldn't cost you the end you were part-way
+// through scanning.
 function openRegistrationPicker() {
-  if (!modelReady || !cameraReady || scanning || picking) return;
+  if (!modelReady || !cameraReady || picking) return;
+
+  resumeScanAfterPicker = scanning;
+  if (scanning) {
+    scanning = false;
+    if (rafId) cancelAnimationFrame(rafId);
+  }
 
   pickerSelection.clear();
   picking = true;
-  scanBtn.disabled = true;
   registerBtn.disabled = true;
   pickerModal.hidden = false;
   renderPickerGrid();
@@ -376,8 +405,16 @@ function renderPickerGrid() {
 function closePicker() {
   picking = false;
   pickerModal.hidden = true;
-  scanBtn.disabled = false;
   registerBtn.disabled = false;
+
+  if (resumeScanAfterPicker) {
+    resumeScanAfterPicker = false;
+    scanning = true;
+    scanBtn.hidden = false;
+    scanBtn.textContent = 'Stop Scan';
+    video.play();
+    rafId = requestAnimationFrame(processFrame);
+  }
 }
 
 function cancelPicker() {
@@ -406,7 +443,7 @@ function confirmPicker() {
   if (frozen) {
     renderFrozen();
   } else {
-    setStatus(`Registered ${name} (${team === 'mine' ? 'yours' : "opponent's"}) with ${selected.length} view(s). Hold the phone over the rink and tap Start Scan.`);
+    setStatus(`Registered ${name} (${team === 'mine' ? 'yours' : "opponent's"}) with ${selected.length} view(s).`);
   }
 }
 
@@ -442,19 +479,23 @@ function renderRegistryList() {
 const RANK_COLORS = ['#66bb6a', '#9ccc65', '#ffee58', '#ffb74d', '#ef5350'];
 const JACK_COLOR = '#ffd54f';
 const UNRANKED_COLOR = '#42a5f5';
+// Deliberately neutral, so a remembered bowl never reads as a fresh detection.
+const GHOST_COLOR = '#b0bec5';
 
-function drawOverlay(detections, jack, ranking, mapSnapshot) {
+function drawOverlay(detections, jack, ranking, ghosts) {
   overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
 
-  // Draw ghost outlines for tracked bowls not currently detected (light, low opacity)
-  if (mapSnapshot) {
-    for (const bowl of mapSnapshot.bowls) {
-      // Skip if this bowl was detected in this frame
-      if (detections.some(d => d === bowl)) continue;
-      const color = UNRANKED_COLOR;
-      // Very faint ghost: 0.2 opacity, no glow, dashed outline
-      drawAura(bowl, color, false, 0.2, true);
+  // Ghosts go down first, underneath the live detections: bowls the map knows
+  // are here but that this frame's detector didn't find. Without these the
+  // overlay blinks empty whenever detection has a weak frame, which reads as
+  // "it has lost everything" when in fact nothing has been lost at all.
+  for (const ghost of ghosts || []) {
+    if (ghost.x < -ghost.r || ghost.y < -ghost.r || ghost.x > overlay.width + ghost.r || ghost.y > overlay.height + ghost.r) {
+      continue; // off-screen this frame
     }
+    const covered = detections.some(d => Math.hypot(d.x - ghost.x, d.y - ghost.y) < Math.max(d.r, ghost.r));
+    if (covered) continue; // a live detection is already drawn over it
+    drawAura(ghost, GHOST_COLOR, false, ghost.confirmed ? 0.4 : 0.18, true);
   }
 
   // Draw current detections with full confidence
@@ -536,19 +577,38 @@ function drawFlag(d, rank, fillColor) {
   overlayCtx.fillText(String(rank), poleX + flagW * 0.4, topY + flagH * 0.32);
 }
 
-function renderRanking(ranking, usable, reason, detectionCount) {
+// One line per frame describing what the map is doing, so a weak detection
+// frame never looks like a failure. The distinction that matters to whoever
+// is holding the phone is "am I still on the map or not" — a frame that found
+// only two bowls is fine as long as it was placed.
+function trackingStatus(slamResult, snapshot) {
+  const confirmed = snapshot.ranking.filter(r => r.confirmed).length;
+  const mapped = snapshot.bowls.length;
+
+  if (!slamResult.merged) {
+    return `Lost the map — pan back over bowls you've already scanned. (${slamResult.reason})`;
+  }
+  if (!snapshot.usable) {
+    return `Tracking ${mapped} bowl(s) — now take one look at the jack to start scoring.`;
+  }
+  const lead = slamResult.relocalised ? 'Found your place again' : 'Tracking';
+  return `${lead} · ${mapped} bowl(s) mapped, ${confirmed} confirmed. Stop when ready.`;
+}
+
+function renderTrackingList(snapshot, detectionCount) {
   rankingEl.innerHTML = '';
 
-  if (!usable) {
+  if (!snapshot.usable) {
     const li = document.createElement('li');
-    li.textContent = `${reason} (${detectionCount} circle(s) detected)`;
+    li.textContent = `${snapshot.reason} — ${snapshot.bowls.length} bowl(s) mapped so far, ${detectionCount} seen this frame.`;
     rankingEl.appendChild(li);
     return;
   }
 
-  ranking.forEach((entry, i) => {
+  snapshot.ranking.forEach((entry, i) => {
     const li = document.createElement('li');
-    li.textContent = `#${i + 1} bowl — ${entry.dist.toFixed(2)} bowl-diameters from jack`;
+    const mark = entry.confirmed ? '' : ' (still confirming)';
+    li.textContent = `#${i + 1} bowl — ${entry.dist.toFixed(2)} bowl-diameters from jack${mark}`;
     rankingEl.appendChild(li);
   });
 }
