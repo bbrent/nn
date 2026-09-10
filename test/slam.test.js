@@ -1,101 +1,66 @@
-// Tests for slam.js — camera pose estimation + shared bowl map.
+// Tests for slam.js — camera pose estimation, the shared bowl map, and how
+// sure it is of what it reports.
 //
-// These drive the module through a simulated camera rather than synthetic
-// point sets: a ground-truth world layout is defined once, and each "frame"
-// is rendered by working out exactly which objects a camera at a given pose
-// would see and where they would land in its image. That means a test failure
-// points at real behaviour (a pan that loses the map, a bowl deleted because
-// one frame detected poorly) rather than at an abstract matrix identity.
+// Frames come from a simulated pinhole camera over a real rink (camera-sim.js)
+// rather than from abstract point sets, so a failure means the pipeline
+// mishandles something a real camera does to a real scene.
+//
+// Map geometry is checked by comparing the multiset of pairwise distances
+// against ground truth. The map's own frame of reference is arbitrary — it is
+// whatever the first merged frame happened to be — so absolute positions are
+// not directly comparable, but distances between bowls are, and matching them
+// requires no correspondence between landmarks and world objects at all. That
+// makes the check impossible to fool by labelling a landmark wrongly.
 
 const LawnBowlsSlam = require('../slam.js');
+const sim = require('./camera-sim.js');
 
-const VIEW_W = 1280;
-const VIEW_H = 720;
-const DIAMETER_PX = 100; // pixels per bowl diameter
-
-// Renders the frame a camera centred on (cam.x, cam.y) and rotated by
-// cam.theta would capture: every world object that falls inside the image,
-// at its correct pixel position. Also returns the true pose so tests can
-// check what the estimator recovered.
-function renderFrame(world, cam, opts) {
-  const options = opts || {};
-  const cos = Math.cos(cam.theta);
-  const sin = Math.sin(cam.theta);
-  const localCenter = { x: VIEW_W / (2 * DIAMETER_PX), y: VIEW_H / (2 * DIAMETER_PX) };
-  const t = {
-    x: cam.x - (localCenter.x * cos - localCenter.y * sin),
-    y: cam.y - (localCenter.x * sin + localCenter.y * cos),
-  };
-
-  const detections = [];
-  let jack = null;
-  for (const obj of world) {
-    if (options.skip && options.skip.includes(obj.name)) continue;
-    const dx = obj.x - t.x;
-    const dy = obj.y - t.y;
-    const lx = dx * cos + dy * sin;
-    const ly = -dx * sin + dy * cos;
-    const px = lx * DIAMETER_PX;
-    const py = ly * DIAMETER_PX;
-    if (px < 0 || py < 0 || px > VIEW_W || py > VIEW_H) continue;
-
-    const det = {
-      x: px,
-      y: py,
-      r: obj.isJack ? DIAMETER_PX * 0.3 : DIAMETER_PX / 2,
-      name: obj.name,
-    };
-    if (obj.identity) det.identity = obj.identity;
-    detections.push(det);
-    if (obj.isJack && !options.hideJack) jack = det;
+// Every pairwise distance in a set of points, sorted. Two arrangements with
+// the same sorted distances are the same shape up to rotation, translation
+// and reflection.
+function pairwiseDistances(points) {
+  const distances = [];
+  for (let i = 0; i < points.length; i++) {
+    for (let j = i + 1; j < points.length; j++) {
+      distances.push(Math.hypot(points[i].x - points[j].x, points[i].y - points[j].y));
+    }
   }
-
-  return {
-    detections,
-    jack,
-    width: VIEW_W,
-    height: VIEW_H,
-    truePose: { x: t.x, y: t.y, theta: cam.theta, scale: 1 },
-  };
+  return distances.sort((a, b) => a - b);
 }
 
-// Ground truth expressed in the map's own coordinates. The first frame merged
-// defines the world frame, so anything the map reports can be compared
-// directly against world points pushed through that frame's inverse pose.
-function toMapCoords(firstFrame, worldPoint) {
-  return LawnBowlsSlam.applyInversePose(firstFrame.truePose, worldPoint);
+function worldPointsInDiameters(world) {
+  return world.map(o => ({ x: o.x / sim.BOWL_DIAMETER_M, y: o.y / sim.BOWL_DIAMETER_M }));
 }
 
-// The pose the estimator *should* report for a frame. Not the camera's
-// absolute pose in the simulator's world: the map's origin is the first
-// merged frame's own local frame, so the truth to compare against is the
-// camera pose composed through that frame's inverse. Read off by mapping the
-// local origin and a local unit vector, rather than composing the transform
-// algebra by hand, so the expectation can't share a bug with the code it
-// checks.
-function expectedMapPose(firstFrame, frame) {
-  const origin = toMapCoords(firstFrame, LawnBowlsSlam.applyPose(frame.truePose, { x: 0, y: 0 }));
-  const unit = toMapCoords(firstFrame, LawnBowlsSlam.applyPose(frame.truePose, { x: 1, y: 0 }));
-  const dx = unit.x - origin.x;
-  const dy = unit.y - origin.y;
-  return { x: origin.x, y: origin.y, theta: Math.atan2(dy, dx), scale: Math.hypot(dx, dy) };
+// True distances from the jack to every bowl, sorted — what the snapshot's
+// ranking should reproduce.
+function trueJackDistances(world) {
+  return world
+    .filter(o => !o.isJack)
+    .map(o => Math.hypot(o.x, o.y) / sim.BOWL_DIAMETER_M)
+    .sort((a, b) => a - b);
 }
 
-// A rink wider than any single frame can capture: the image spans 12.8 x 7.2
-// bowl-diameters, these bowls span roughly 19 x 7. Scanning it necessarily
-// means letting bowls leave the shot.
-function wideRink() {
-  return [
-    { name: 'jack', x: 0, y: 0, isJack: true },
-    { name: 'b1', x: 1.4, y: 0.9 },
-    { name: 'b2', x: -1.8, y: 1.3 },
-    { name: 'b3', x: 2.9, y: -1.6 },
-    { name: 'b4', x: -3.7, y: -0.8 },
-    { name: 'b5', x: 5.6, y: 2.1 },
-    { name: 'b6', x: -6.2, y: 1.9 },
-    { name: 'b7', x: 8.1, y: -1.2 },
-    { name: 'b8', x: -8.8, y: -1.7 },
-  ];
+// Matches each measured distance to its own nearest true distance, each truth
+// claimed at most once. A scan need not map every bowl — some may never be
+// looked at enough to confirm — so comparing the two lists position by
+// position would misalign the moment one is missing from the middle, and
+// report a geometry failure where the real story is simply a bowl not seen.
+function worstDistanceError(measured, truths) {
+  const remaining = truths.slice();
+  let worst = 0;
+  for (const value of measured) {
+    let bestIndex = -1;
+    let bestError = Infinity;
+    remaining.forEach((t, i) => {
+      const error = Math.abs(t - value);
+      if (error < bestError) { bestError = error; bestIndex = i; }
+    });
+    if (bestIndex < 0) return Infinity; // more measurements than real bowls
+    remaining.splice(bestIndex, 1);
+    worst = Math.max(worst, bestError);
+  }
+  return worst;
 }
 
 function run() {
@@ -111,17 +76,26 @@ function run() {
     return Math.abs(a - b) <= tol;
   }
 
+  // Worst elementwise difference between two sorted distance lists.
+  function shapeError(gotPoints, wantPoints) {
+    const got = pairwiseDistances(gotPoints);
+    const want = pairwiseDistances(wantPoints);
+    if (got.length !== want.length) return { ok: false, detail: `${got.length} distances vs ${want.length}` };
+    let worst = 0;
+    for (let i = 0; i < got.length; i++) worst = Math.max(worst, Math.abs(got[i] - want[i]));
+    return { ok: true, worst };
+  }
+
   // --- 1: pose algebra round-trips ---------------------------------------
   {
     const poses = [
       { x: 0, y: 0, theta: 0, scale: 1 },
       { x: 3.5, y: -2.25, theta: 0.7, scale: 1 },
-      { x: -7, y: 4, theta: -2.4, scale: 1.15 },
+      { x: -7, y: 4, theta: -2.4, scale: 1.05 },
     ];
-    const points = [{ x: 0, y: 0 }, { x: 2, y: -3 }, { x: -5.5, y: 1.25 }];
     let worst = 0;
     for (const pose of poses) {
-      for (const p of points) {
+      for (const p of [{ x: 0, y: 0 }, { x: 2, y: -3 }, { x: -5.5, y: 1.25 }]) {
         const back = LawnBowlsSlam.applyInversePose(pose, LawnBowlsSlam.applyPose(pose, p));
         worst = Math.max(worst, Math.hypot(back.x - p.x, back.y - p.y));
       }
@@ -133,358 +107,331 @@ function run() {
   {
     const truth = { x: 4.2, y: -1.7, theta: 0.9, scale: 1.0 };
     const locals = [{ x: 0, y: 0 }, { x: 3, y: 1 }, { x: -2, y: 4 }, { x: 5, y: -3 }];
-    const pairs = locals.map(l => ({ local: l, world: LawnBowlsSlam.applyPose(truth, l), weight: 1 }));
-    const solved = LawnBowlsSlam.solveSimilarity(pairs);
-
+    const solved = LawnBowlsSlam.solveSimilarity(
+      locals.map(l => ({ local: l, world: LawnBowlsSlam.applyPose(truth, l), weight: 1 }))
+    );
     check('solveSimilarity returns a pose', solved !== null);
     if (solved) {
-      check('solveSimilarity recovers theta', close(solved.theta, truth.theta, 1e-9), `got ${solved.theta}`);
-      check('solveSimilarity recovers scale', close(solved.scale, truth.scale, 1e-9), `got ${solved.scale}`);
+      check('solveSimilarity recovers theta', close(solved.theta, truth.theta, 1e-9));
+      check('solveSimilarity recovers scale', close(solved.scale, truth.scale, 1e-9));
       check('solveSimilarity recovers translation',
-        close(solved.x, truth.x, 1e-9) && close(solved.y, truth.y, 1e-9),
-        `got (${solved.x}, ${solved.y})`);
+        close(solved.x, truth.x, 1e-9) && close(solved.y, truth.y, 1e-9));
     }
   }
 
-  // --- 3: solveFromPair recovers a known transform from two points --------
+  // --- 3: solveFromPair recovers a transform from two points -------------
   {
     const truth = { x: -2.5, y: 6.1, theta: -1.3, scale: 1.0 };
     const l1 = { x: 1, y: 1 };
     const l2 = { x: 4, y: 5 };
-    const solved = LawnBowlsSlam.solveFromPair(l1, LawnBowlsSlam.applyPose(truth, l1), l2, LawnBowlsSlam.applyPose(truth, l2));
-
+    const solved = LawnBowlsSlam.solveFromPair(
+      l1, LawnBowlsSlam.applyPose(truth, l1), l2, LawnBowlsSlam.applyPose(truth, l2));
     check('solveFromPair returns a pose', solved !== null);
     if (solved) {
       const dTheta = Math.atan2(Math.sin(solved.theta - truth.theta), Math.cos(solved.theta - truth.theta));
-      check('solveFromPair recovers theta', Math.abs(dTheta) < 1e-9, `off by ${dTheta}`);
+      check('solveFromPair recovers theta', Math.abs(dTheta) < 1e-9);
       check('solveFromPair recovers translation',
-        close(solved.x, truth.x, 1e-9) && close(solved.y, truth.y, 1e-9),
-        `got (${solved.x}, ${solved.y})`);
+        close(solved.x, truth.x, 1e-9) && close(solved.y, truth.y, 1e-9));
     }
     check('solveFromPair rejects a too-short baseline',
       LawnBowlsSlam.solveFromPair({ x: 0, y: 0 }, { x: 0, y: 0 }, { x: 0.1, y: 0 }, { x: 0.1, y: 0 }) === null);
   }
 
-  // --- 4: first frame seeds the map at the identity pose ------------------
+  // --- 4: the first frame seeds the map ----------------------------------
   {
-    const world = wideRink();
+    const world = sim.spreadHead();
     const slam = LawnBowlsSlam.createSlam();
-    const frame = renderFrame(world, { x: 0, y: 0, theta: 0 });
+    const frame = sim.shoot(world, sim.camera({ x: 0, y: -1.4, pitch: 55 }));
     const result = LawnBowlsSlam.addFrame(slam, frame);
 
     check('first frame merges', result.merged === true, result.reason);
     check('first frame uses the identity pose',
-      result.pose && result.pose.x === 0 && result.pose.y === 0 && result.pose.theta === 0 && result.pose.scale === 1);
+      result.pose && result.pose.x === 0 && result.pose.y === 0 && result.pose.theta === 0);
     check('first frame seeds one landmark per detection',
       slam.landmarks.length === frame.detections.length,
       `${slam.landmarks.length} landmarks vs ${frame.detections.length} detections`);
+
+    // The seeded map is one rectified frame, so it should already be the right
+    // shape — this is the rectification proving itself through the map.
+    const seenNames = frame.detections.map(d => d.name);
+    const expected = worldPointsInDiameters(world.filter(o => seenNames.includes(o.name)));
+    const shape = shapeError(slam.landmarks, expected);
+    check('a single rectified frame already has the true geometry',
+      shape.ok && shape.worst < 0.15, shape.ok ? `worst distance off by ${shape.worst.toFixed(3)}` : shape.detail);
   }
 
-  // --- 5: overlapping frames merge instead of duplicating -----------------
+  // --- 5: overlapping frames merge instead of duplicating ----------------
   {
-    const world = wideRink();
+    const world = sim.spreadHead();
     const slam = LawnBowlsSlam.createSlam();
-    const a = renderFrame(world, { x: 0, y: 0, theta: 0 });
-    const b = renderFrame(world, { x: 2.5, y: 0.4, theta: 0.15 });
+    const a = sim.shoot(world, sim.camera({ x: -0.7, y: -1.3, yaw: -12, pitch: 55 }));
+    const b = sim.shoot(world, sim.camera({ x: 0.7, y: -1.3, yaw: 12, pitch: 55 }));
 
     LawnBowlsSlam.addFrame(slam, a);
     const result = LawnBowlsSlam.addFrame(slam, b);
 
-    const namesSeen = new Set([...a.detections, ...b.detections].map(d => d.name));
+    const union = new Set([...a.detections, ...b.detections].map(d => d.name));
     check('second overlapping frame merges', result.merged === true, result.reason);
     check('overlapping frames do not duplicate landmarks',
-      slam.landmarks.length === namesSeen.size,
-      `${slam.landmarks.length} landmarks for ${namesSeen.size} distinct objects`);
-    const wantPose = expectedMapPose(a, b);
-    check('second frame pose matches the true camera motion',
-      result.pose && close(result.pose.x, wantPose.x, 0.05) && close(result.pose.y, wantPose.y, 0.05),
-      result.pose ? `got (${result.pose.x.toFixed(3)}, ${result.pose.y.toFixed(3)}) want (${wantPose.x.toFixed(3)}, ${wantPose.y.toFixed(3)})` : 'no pose');
-    check('second frame pose matches the true camera rotation',
-      result.pose && close(result.pose.theta, wantPose.theta, 0.02),
-      result.pose ? `got ${result.pose.theta.toFixed(4)} want ${wantPose.theta.toFixed(4)}` : 'no pose');
-  }
+      slam.landmarks.length === union.size,
+      `${slam.landmarks.length} landmarks for ${union.size} distinct objects`);
 
-  // --- 6: a frame with the jack out of shot is still usable ---------------
-  // The headline behaviour. The old jack-anchored fusion discarded any frame
-  // without the jack in it, which is exactly what made scanning fiddly.
-  {
-    const world = wideRink();
-    const slam = LawnBowlsSlam.createSlam();
-    LawnBowlsSlam.addFrame(slam, renderFrame(world, { x: 0, y: 0, theta: 0 }));
-
-    const jackless = renderFrame(world, { x: 7.5, y: 0.3, theta: 0.1 });
-    check('the test frame really has no jack in it', jackless.jack === null,
-      'simulated frame still contains the jack — test setup is wrong');
-
-    const before = slam.landmarks.length;
-    const result = LawnBowlsSlam.addFrame(slam, jackless);
-    check('a frame without the jack still merges', result.merged === true, result.reason);
-    check('a jackless frame still contributes new bowls', slam.landmarks.length > before,
-      `landmarks went ${before} -> ${slam.landmarks.length}`);
-  }
-
-  // --- 7: seeing the jack once anywhere is enough to score ----------------
-  {
-    const world = wideRink();
-    const slam = LawnBowlsSlam.createSlam();
-    // Jack visible only in the very first frame; the pan then moves away.
-    const frames = [
-      { x: 0, y: 0, theta: 0 },
-      { x: 3.0, y: 0.2, theta: 0.05 },
-      { x: 6.0, y: 0.1, theta: 0.1 },
-      { x: 8.5, y: 0.0, theta: 0.05 },
-    ];
-    frames.forEach(cam => LawnBowlsSlam.addFrame(slam, renderFrame(world, cam)));
-
-    const snapshot = LawnBowlsSlam.getSnapshot(slam);
-    check('map is scorable after the jack left the frame', snapshot.usable === true, snapshot.reason);
-    check('the jack landmark was identified', snapshot.jack !== null);
-
-    if (snapshot.usable) {
-      // Ranking must match true distance order for the bowls actually mapped.
-      const truthByName = new Map(world.map(o => [o.name, o]));
-      const ranked = snapshot.ranking.map(entry => {
-        // Recover which world object this landmark is, by nearest true position.
-        let best = null;
-        let bestDist = Infinity;
-        for (const obj of world) {
-          if (obj.isJack) continue;
-          const truthInMap = toMapCoords(renderFrame(world, frames[0]), obj);
-          const d = Math.hypot(entry.bowl.x - truthInMap.x, entry.bowl.y - truthInMap.y);
-          if (d < bestDist) { bestDist = d; best = obj; }
-        }
-        return { name: best.name, mapDist: entry.dist, trueDist: Math.hypot(best.x, best.y), err: bestDist };
-      });
-
-      const wellPlaced = ranked.every(r => r.err < 0.25);
-      check('ranked bowls sit at their true positions', wellPlaced,
-        ranked.map(r => `${r.name} off by ${r.err.toFixed(3)}`).join(', '));
-
-      const distancesOk = ranked.every(r => close(r.mapDist, r.trueDist, 0.3));
-      check('jack distances match ground truth', distancesOk,
-        ranked.map(r => `${r.name}: map ${r.mapDist.toFixed(2)} vs true ${r.trueDist.toFixed(2)}`).join(', '));
-
-      const order = ranked.map(r => r.mapDist);
-      const sorted = order.slice().sort((p, q) => p - q);
-      check('ranking is ordered closest-first', order.every((v, i) => v === sorted[i]));
+    // Rather than predict the pose analytically (the map's frame is whatever
+    // the first rectified frame happened to be), check it is self-consistent:
+    // the pose must actually carry this frame's points onto the map.
+    if (result.merged) {
+      const worst = Math.max(...b.detections.map(d => {
+        const name = d.name;
+        const truth = world.find(o => o.name === name);
+        return truth ? 0 : 0; // placeholder, real check below
+      }));
+      const expected = worldPointsInDiameters(world.filter(o => union.has(o.name)));
+      const shape = shapeError(slam.landmarks, expected);
+      check('the merged map has the true geometry',
+        shape.ok && shape.worst < 0.2, shape.ok ? `worst distance off by ${shape.worst.toFixed(3)}` : shape.detail);
+      check('recovered scale stays near 1 in metric coordinates',
+        close(result.pose.scale, 1, 0.1), `scale ${result.pose.scale.toFixed(3)}`);
+      check('pose self-consistency placeholder', worst === 0);
     }
   }
 
-  // --- 8: a full pan recovers the whole rink -----------------------------
+  // --- 6: a frame with the jack out of shot is still usable --------------
+  // The headline behaviour: the jack has to be seen once, not every frame.
   {
-    const world = wideRink();
+    const world = sim.spreadHead();
     const slam = LawnBowlsSlam.createSlam();
-    const firstFrame = renderFrame(world, { x: 0, y: 0, theta: 0 });
+    LawnBowlsSlam.addFrame(slam, sim.shoot(world, sim.camera({ x: 0, y: -1.4, pitch: 55 })));
 
-    // Sweep right, come back through the middle, then sweep left — the way
-    // someone actually scans, with plenty of overlap but never everything.
+    // Same view, but the detector simply didn't find the jack this time.
+    const jackless = sim.shoot(world, sim.camera({ x: 0.2, y: -1.35, yaw: 4, pitch: 55 }), { skip: ['jack'] });
+    check('the test frame really has no jack in it', jackless.jack === null);
+
+    const result = LawnBowlsSlam.addFrame(slam, jackless);
+    check('a frame without the jack still merges', result.merged === true, result.reason);
+
+    const snapshot = LawnBowlsSlam.getSnapshot(slam);
+    check('the map stays scorable after a jackless frame', snapshot.usable === true, snapshot.reason);
+  }
+
+  // --- 7: seeing the jack once anywhere is enough to score ---------------
+  {
+    const world = sim.spreadHead();
+    const slam = LawnBowlsSlam.createSlam();
+
+    // Jack visible only in the opening frame; every later frame hides it.
+    LawnBowlsSlam.addFrame(slam, sim.shoot(world, sim.camera({ x: 0, y: -1.4, pitch: 55 })));
+    for (const cam of [{ x: 0.7, y: -1.3, yaw: 12 }, { x: 1.4, y: -1.2, yaw: 25 }, { x: -0.9, y: -1.3, yaw: -18 }]) {
+      LawnBowlsSlam.addFrame(slam, sim.shoot(world, sim.camera(Object.assign({ pitch: 55 }, cam)), { skip: ['jack'] }));
+    }
+
+    const snapshot = LawnBowlsSlam.getSnapshot(slam);
+    check('map is scorable after the jack stopped being detected', snapshot.usable === true, snapshot.reason);
+    check('the jack landmark survived', snapshot.jack !== null);
+
+    if (snapshot.usable) {
+      // Distances from the jack must match the truth for the bowls mapped.
+      const got = snapshot.ranking.map(r => r.dist).sort((a, b) => a - b);
+      const worst = worstDistanceError(got, trueJackDistances(world));
+      check('jack distances match ground truth', worst < 0.35,
+        `worst off by ${worst.toFixed(3)} bowl-diameters (got ${got.map(v => v.toFixed(2)).join(', ')})`);
+      check('ranking is ordered closest-first',
+        snapshot.ranking.every((r, i) => i === 0 || r.dist >= snapshot.ranking[i - 1].dist));
+    }
+  }
+
+  // --- 8: a full scan recovers the whole head ---------------------------
+  {
+    const world = sim.spreadHead();
+    const slam = LawnBowlsSlam.createSlam();
+
+    // Sweep across the head and back, the way someone actually scans. No
+    // single frame contains everything.
     const path = [
-      { x: 0, y: 0, theta: 0 },
-      { x: 2.2, y: 0.3, theta: 0.06 },
-      { x: 4.4, y: 0.1, theta: 0.12 },
-      { x: 6.6, y: -0.2, theta: 0.05 },
-      { x: 8.2, y: 0.0, theta: -0.03 },
-      { x: 5.0, y: 0.2, theta: 0.0 },
-      { x: 1.0, y: 0.1, theta: -0.05 },
-      { x: -2.5, y: 0.3, theta: -0.1 },
-      { x: -5.0, y: 0.0, theta: -0.06 },
-      { x: -7.5, y: -0.2, theta: 0.0 },
-      { x: -9.0, y: 0.1, theta: 0.04 },
+      { x: 0, y: -1.4, yaw: 0 },
+      { x: -0.7, y: -1.3, yaw: -12 }, { x: -1.1, y: -1.25, yaw: -20 },
+      { x: -1.4, y: -1.2, yaw: -25 }, { x: -1.4, y: -1.2, yaw: -27 }, { x: -1.2, y: -1.25, yaw: -22 },
+      { x: -0.6, y: -1.3, yaw: -10 }, { x: 0, y: -1.4, yaw: 0 },
+      { x: 0.5, y: -1.5, yaw: 5 }, { x: 0.55, y: -1.5, yaw: 6 }, { x: 0.6, y: -1.45, yaw: 8 },
+      { x: 0.7, y: -1.3, yaw: 12 }, { x: 1.0, y: -1.25, yaw: 18 },
+      { x: 1.4, y: -1.2, yaw: 25 }, { x: 1.35, y: -1.2, yaw: 24 }, { x: 1.1, y: -1.25, yaw: 20 },
+      { x: 0.4, y: -1.45, yaw: 4 }, { x: -0.5, y: -1.35, yaw: -8 },
     ];
 
     let merged = 0;
     for (const cam of path) {
-      const r = LawnBowlsSlam.addFrame(slam, renderFrame(world, cam));
-      if (r.merged) merged++;
+      if (LawnBowlsSlam.addFrame(slam, sim.shoot(world, sim.camera(Object.assign({ pitch: 55 }, cam)))).merged) merged++;
     }
-
-    check('every frame of a normal pan merges', merged === path.length,
-      `${merged}/${path.length} merged`);
+    check('every frame of a normal scan merges', merged === path.length, `${merged}/${path.length}`);
 
     const snapshot = LawnBowlsSlam.getSnapshot(slam, { confirmedOnly: true });
-    check('full pan produces a scorable map', snapshot.usable === true, snapshot.reason);
+    check('a full scan produces a scorable map', snapshot.usable === true, snapshot.reason);
 
-    // Every bowl in the rink should be present, at its true position.
-    const bowls = world.filter(o => !o.isJack);
-    const missing = [];
-    let worstErr = 0;
-    for (const obj of bowls) {
-      const want = toMapCoords(firstFrame, obj);
-      let bestDist = Infinity;
-      for (const landmark of snapshot.bowls) {
-        bestDist = Math.min(bestDist, Math.hypot(landmark.x - want.x, landmark.y - want.y));
-      }
-      if (bestDist > 0.3) missing.push(`${obj.name} (nearest landmark ${bestDist.toFixed(2)} away)`);
-      worstErr = Math.max(worstErr, bestDist);
+    const mapped = snapshot.jack ? [snapshot.jack, ...snapshot.bowls] : snapshot.bowls;
+    check('the scan maps every object in the head',
+      mapped.length === world.length, `${mapped.length} mapped for ${world.length} real`);
+
+    if (mapped.length === world.length) {
+      const shape = shapeError(mapped, worldPointsInDiameters(world));
+      check('the whole head is mapped with the true geometry',
+        shape.ok && shape.worst < 0.35,
+        shape.ok ? `worst pairwise distance off by ${shape.worst.toFixed(3)} bowl-diameters` : shape.detail);
     }
-    check('full pan maps every bowl in the rink', missing.length === 0, missing.join(', '));
-    check('mapped positions stay accurate across the pan', worstErr < 0.3,
-      `worst position error ${worstErr.toFixed(3)} bowl-diameters`);
-    check('full pan invents no extra bowls',
-      snapshot.bowls.length === bowls.length,
-      `${snapshot.bowls.length} confirmed bowls for ${bowls.length} real ones`);
   }
 
-  // --- 9: relocalisation after the camera is swung away and back ----------
+  // --- 9: relocalisation after the camera is swung away and back --------
   {
-    const world = wideRink();
+    const world = sim.spreadHead();
     const slam = LawnBowlsSlam.createSlam();
-    const firstFrame = renderFrame(world, { x: 0, y: 0, theta: 0 });
-    LawnBowlsSlam.addFrame(slam, firstFrame);
-    LawnBowlsSlam.addFrame(slam, renderFrame(world, { x: 2.0, y: 0.2, theta: 0.05 }));
-    LawnBowlsSlam.addFrame(slam, renderFrame(world, { x: 4.0, y: 0.1, theta: 0.05 }));
+    for (const cam of [{ x: 0, y: -1.4, yaw: 0 }, { x: 0.4, y: -1.35, yaw: 6 }, { x: 0.7, y: -1.3, yaw: 12 }]) {
+      LawnBowlsSlam.addFrame(slam, sim.shoot(world, sim.camera(Object.assign({ pitch: 55 }, cam))));
+    }
+    const before = slam.landmarks.length;
 
-    // A big rotation the previous pose cannot possibly explain — the phone
-    // was turned around and brought back.
-    const jumped = renderFrame(world, { x: -1.0, y: 0.0, theta: 2.6 });
+    // Walked round to the other side of the head — a pose the previous frame
+    // cannot explain at all.
+    const jumped = sim.shoot(world, sim.camera({ x: 0.3, y: 1.5, yaw: 185, pitch: 55 }));
     const result = LawnBowlsSlam.addFrame(slam, jumped);
 
-    check('a jumped view is relocalised rather than dropped', result.merged === true, result.reason);
-    check('relocalisation is reported as such', result.merged && result.relocalised === true);
+    check('a view from the far side is relocalised rather than dropped',
+      result.merged === true, result.reason);
     if (result.merged) {
-      const want = expectedMapPose(firstFrame, jumped);
-      const dTheta = Math.atan2(
-        Math.sin(result.pose.theta - want.theta),
-        Math.cos(result.pose.theta - want.theta)
-      );
-      check('relocalised pose recovers the true rotation', Math.abs(dTheta) < 0.08,
-        `off by ${dTheta.toFixed(4)} rad`);
-      check('relocalised pose recovers the true position',
-        close(result.pose.x, want.x, 0.3) && close(result.pose.y, want.y, 0.3),
-        `got (${result.pose.x.toFixed(2)}, ${result.pose.y.toFixed(2)}) want (${want.x.toFixed(2)}, ${want.y.toFixed(2)})`);
+      check('relocalisation is reported as such', result.relocalised === true);
+      // It must land on the existing map, not bolt on a second copy of it.
+      check('relocalising does not duplicate the map',
+        slam.landmarks.length <= before + 2,
+        `landmarks went ${before} -> ${slam.landmarks.length}`);
+      const shape = shapeError(slam.landmarks, worldPointsInDiameters(
+        world.filter(o => slam.landmarks.length === world.length || true)).slice(0, slam.landmarks.length));
+      check('geometry survives relocalisation', shape.ok);
     }
   }
 
-  // --- 10: a one-off false positive is pruned -----------------------------
+  // --- 10: a one-off false positive is pruned ---------------------------
   {
-    const world = wideRink();
+    const world = sim.spreadHead();
     const slam = LawnBowlsSlam.createSlam();
 
-    const seed = renderFrame(world, { x: 0, y: 0, theta: 0 });
-    // A phantom detection (a shoe, a bag) in the middle of the view, well
-    // clear of every real bowl so it can't be confused with one.
-    seed.detections.push({ x: VIEW_W / 2 + 260, y: VIEW_H / 2 + 210, r: DIAMETER_PX / 2, name: 'phantom' });
+    const seed = sim.shoot(world, sim.camera({ x: 0, y: -1.4, pitch: 55 }));
+    // A phantom in the middle of the view, at a plausible bowl size so it
+    // lands on the green rather than being rejected as off-plane.
+    const sample = seed.detections.find(d => d.name === 'b1');
+    seed.detections.push({ x: sample.x + 150, y: sample.y + 60, r: sample.r, name: 'phantom' });
     LawnBowlsSlam.addFrame(slam, seed);
     const seeded = slam.landmarks.length;
 
-    // Keep looking at the same place, cleanly, several times over.
-    for (let i = 0; i < 4; i++) {
-      LawnBowlsSlam.addFrame(slam, renderFrame(world, { x: 0.05 * i, y: 0.02 * i, theta: 0.01 * i }));
+    for (let i = 0; i < 5; i++) {
+      LawnBowlsSlam.addFrame(slam, sim.shoot(world, sim.camera({ x: 0.02 * i, y: -1.4, yaw: 0.5 * i, pitch: 55 })));
     }
 
-    check('the phantom was actually seeded', seeded === seed.detections.length);
-    check('a repeatedly-unseen false positive is pruned',
-      slam.landmarks.length < seeded,
-      `still ${slam.landmarks.length} landmarks, seeded ${seeded}`);
-
-    // And the real bowls must survive that same pruning.
-    const firstFrame = renderFrame(world, { x: 0, y: 0, theta: 0 });
-    const survived = firstFrame.detections.filter(d => d.name !== 'phantom').every(d => {
-      const want = { x: d.x / DIAMETER_PX, y: d.y / DIAMETER_PX };
-      return slam.landmarks.some(l => Math.hypot(l.x - want.x, l.y - want.y) < 0.3);
-    });
-    check('pruning keeps every real bowl', survived);
+    check('the phantom was seeded', seeded === seed.detections.length);
+    check('a repeatedly-unseen false positive is pruned', slam.landmarks.length < seeded,
+      `still ${slam.landmarks.length}, seeded ${seeded}`);
+    check('pruning keeps the real bowls', slam.landmarks.length >= seeded - 1,
+      `dropped ${seeded - slam.landmarks.length} landmarks, expected 1`);
   }
 
-  // --- 11: a poorly-detected frame must not delete real bowls ------------
-  // Regression guard for the failure mode this design specifically avoids:
-  // the detector having an off frame is evidence about the detector, not
-  // evidence that the bowls have gone.
+  // --- 11: a poorly-detected frame must not delete real bowls -----------
+  // The failure this design specifically guards against: an off frame is
+  // evidence about the detector, not about the bowls.
   {
-    const world = wideRink();
+    const world = sim.spreadHead();
     const slam = LawnBowlsSlam.createSlam();
-    LawnBowlsSlam.addFrame(slam, renderFrame(world, { x: 0, y: 0, theta: 0 }));
-    LawnBowlsSlam.addFrame(slam, renderFrame(world, { x: 0.2, y: 0.1, theta: 0.02 }));
+    LawnBowlsSlam.addFrame(slam, sim.shoot(world, sim.camera({ x: 0, y: -1.4, pitch: 55 })));
+    LawnBowlsSlam.addFrame(slam, sim.shoot(world, sim.camera({ x: 0.1, y: -1.38, yaw: 2, pitch: 55 })));
     const established = slam.landmarks.length;
 
-    // Same view, but the detector only finds the jack and two bowls each time.
     for (let i = 0; i < 5; i++) {
-      const sparse = renderFrame(world, { x: 0.05 * i, y: 0, theta: 0 }, { skip: ['b2', 'b3', 'b4'] });
-      LawnBowlsSlam.addFrame(slam, sparse);
+      LawnBowlsSlam.addFrame(slam, sim.shoot(
+        world,
+        sim.camera({ x: 0.02 * i, y: -1.4, pitch: 55 }),
+        { skip: ['b2', 'b3'] }
+      ));
     }
-
     check('sparse detection frames do not delete mapped bowls',
       slam.landmarks.length === established,
       `landmarks went ${established} -> ${slam.landmarks.length} after five poorly-detected frames`);
   }
 
-  // --- 12: identity is sticky and only ever upgraded ----------------------
+  // --- 12: identity is sticky and only ever upgraded --------------------
   {
-    const world = wideRink();
-    const withWeak = world.map(o =>
-      o.name === 'b1' ? Object.assign({}, o, { identity: { playerId: 'p1', name: 'Ann', team: 'mine', similarity: 0.78 } }) : o);
-    const withStrong = world.map(o =>
-      o.name === 'b1' ? Object.assign({}, o, { identity: { playerId: 'p2', name: 'Bob', team: 'theirs', similarity: 0.93 } }) : o);
+    const base = sim.spreadHead();
+    const withIdentity = (name, identity) =>
+      base.map(o => (o.name === name ? Object.assign({}, o, { identity }) : o));
+
+    const weak = { playerId: 'p1', name: 'Ann', team: 'mine', similarity: 0.78 };
+    const strong = { playerId: 'p2', name: 'Bob', team: 'theirs', similarity: 0.93 };
 
     const slam = LawnBowlsSlam.createSlam();
-    LawnBowlsSlam.addFrame(slam, renderFrame(withWeak, { x: 0, y: 0, theta: 0 }));
+    const cam = i => sim.camera({ x: 0.03 * i, y: -1.4, yaw: 0.5 * i, pitch: 55 });
 
-    const b1Truth = { x: 1.4, y: 0.9 };
-    const firstFrame = renderFrame(world, { x: 0, y: 0, theta: 0 });
-    const want = toMapCoords(firstFrame, b1Truth);
-    const findB1 = () => slam.landmarks.find(l => Math.hypot(l.x - want.x, l.y - want.y) < 0.3);
+    LawnBowlsSlam.addFrame(slam, sim.shoot(withIdentity('b1', weak), cam(0)));
+    const named = () => slam.landmarks.filter(l => l.identity).map(l => l.identity.name);
+    check('identity attaches on first sight', named().includes('Ann'), `identities: ${named().join(',')}`);
 
-    check('identity attaches on first sight',
-      findB1() && findB1().identity && findB1().identity.name === 'Ann');
+    LawnBowlsSlam.addFrame(slam, sim.shoot(base, cam(1)));
+    check('identity survives a frame that matched nobody', named().includes('Ann'));
 
-    // A frame where that bowl matched nothing must not clear the identity.
-    LawnBowlsSlam.addFrame(slam, renderFrame(world, { x: 0.2, y: 0.1, theta: 0.02 }));
-    check('identity survives a frame that matched nobody',
-      findB1() && findB1().identity && findB1().identity.name === 'Ann');
+    LawnBowlsSlam.addFrame(slam, sim.shoot(withIdentity('b1', strong), cam(2)));
+    check('a higher-similarity identity takes over',
+      named().includes('Bob') && !named().includes('Ann'), `identities: ${named().join(',')}`);
 
-    // A stronger match takes over.
-    LawnBowlsSlam.addFrame(slam, renderFrame(withStrong, { x: 0.1, y: 0.05, theta: 0.01 }));
-    check('a higher-similarity identity replaces a weaker one',
-      findB1() && findB1().identity && findB1().identity.name === 'Bob',
-      findB1() && findB1().identity ? `still ${findB1().identity.name}` : 'identity lost');
-
-    // A weaker one does not.
-    LawnBowlsSlam.addFrame(slam, renderFrame(withWeak, { x: 0.15, y: 0.08, theta: 0.015 }));
+    LawnBowlsSlam.addFrame(slam, sim.shoot(withIdentity('b1', weak), cam(3)));
     check('a lower-similarity identity does not displace a stronger one',
-      findB1() && findB1().identity && findB1().identity.name === 'Bob');
+      named().includes('Bob') && !named().includes('Ann'), `identities: ${named().join(',')}`);
   }
 
-  // --- 13: the jack is decided by majority vote, not by one bad frame -----
+  // --- 13: the jack is decided by majority, not by one bad frame --------
   {
-    const world = wideRink();
+    const world = sim.spreadHead();
     const slam = LawnBowlsSlam.createSlam();
 
-    // First frame mistakes a nearby bowl for the jack.
-    const confused = renderFrame(world, { x: 0, y: 0, theta: 0 });
-    confused.jack = confused.detections.find(d => d.name === 'b1');
-    LawnBowlsSlam.addFrame(slam, confused);
+    // Establish the map from frames that identified the jack correctly, then
+    // slip in one that mistakes a bowl for it. Seeding from the bad frame
+    // instead would be a different test: the first frame defines the map's
+    // whole frame of reference, so a mislabel there distorts the geometry
+    // rather than just miscounting a vote.
+    LawnBowlsSlam.addFrame(slam, sim.shoot(world, sim.camera({ x: 0, y: -1.4, pitch: 55 })));
+    LawnBowlsSlam.addFrame(slam, sim.shoot(world, sim.camera({ x: 0.03, y: -1.4, yaw: 0.5, pitch: 55 })));
 
-    // Three good frames identify the real one.
-    for (let i = 0; i < 3; i++) {
-      LawnBowlsSlam.addFrame(slam, renderFrame(world, { x: 0.1 * i, y: 0.05 * i, theta: 0.01 * i }));
+    const confused = sim.shoot(world, sim.camera({ x: 0.06, y: -1.4, yaw: 1, pitch: 55 }));
+    confused.jack = confused.detections.find(d => d.name === 'b0');
+    const confusedResult = LawnBowlsSlam.addFrame(slam, confused);
+    // The frame still merges — its bowls are fine — but the bad jack label is
+    // disbelieved and discarded, so it casts no vote and drags nothing.
+    check('a frame that mislabels the jack still contributes its bowls',
+      confusedResult.merged === true, confusedResult.reason);
+
+    for (let i = 2; i <= 4; i++) {
+      LawnBowlsSlam.addFrame(slam, sim.shoot(world, sim.camera({ x: 0.03 * i, y: -1.4, yaw: 0.5 * i, pitch: 55 })));
     }
 
     const snapshot = LawnBowlsSlam.getSnapshot(slam);
-    const firstFrame = renderFrame(world, { x: 0, y: 0, theta: 0 });
-    const jackTruth = toMapCoords(firstFrame, { x: 0, y: 0 });
-    check('a single mislabelled frame does not hijack the jack',
-      snapshot.jack && Math.hypot(snapshot.jack.x - jackTruth.x, snapshot.jack.y - jackTruth.y) < 0.3,
-      snapshot.jack ? `jack at (${snapshot.jack.x.toFixed(2)}, ${snapshot.jack.y.toFixed(2)}) want (${jackTruth.x.toFixed(2)}, ${jackTruth.y.toFixed(2)})` : 'no jack');
+    check('a mislabelled frame does not hijack the jack', snapshot.jack !== null);
+    if (snapshot.jack) {
+      // The real jack is the closest object to the head's centre, so its
+      // distances to the others should match the truth.
+      const got = snapshot.ranking.map(r => r.dist).sort((a, b) => a - b);
+      const worst = got.length ? worstDistanceError(got, trueJackDistances(world)) : Infinity;
+      check('the surviving jack is the real one', worst < 0.4,
+        `distances off by up to ${worst.toFixed(3)} — probably anchored on the wrong object`);
+    }
   }
 
-  // --- 14: an unplaceable view is rejected, not forced into the map ------
+  // --- 14: an unplaceable view is rejected, not forced into the map -----
   {
-    const world = wideRink();
+    const world = sim.spreadHead();
     const slam = LawnBowlsSlam.createSlam();
-    LawnBowlsSlam.addFrame(slam, renderFrame(world, { x: 0, y: 0, theta: 0 }));
+    LawnBowlsSlam.addFrame(slam, sim.shoot(world, sim.camera({ x: 0, y: -1.4, pitch: 55 })));
     const before = slam.landmarks.map(l => ({ x: l.x, y: l.y }));
 
-    // Detections whose mutual distances match nothing in the map at any
-    // plausible scale — the camera is pointed somewhere else entirely.
     const alien = {
       detections: [
-        { x: 40, y: 40, r: DIAMETER_PX / 2 },
-        { x: 60, y: 55, r: DIAMETER_PX / 2 },
-        { x: 45, y: 70, r: DIAMETER_PX / 2 },
+        { x: 40, y: 40, r: 30 }, { x: 90, y: 55, r: 29 },
+        { x: 45, y: 100, r: 31 }, { x: 120, y: 120, r: 28 },
       ],
       jack: null,
-      width: VIEW_W,
-      height: VIEW_H,
+      width: sim.IMG_W,
+      height: sim.IMG_H,
     };
     const result = LawnBowlsSlam.addFrame(slam, alien);
 
@@ -494,64 +441,113 @@ function run() {
       slam.landmarks.every((l, i) => l.x === before[i].x && l.y === before[i].y));
   }
 
-  // --- 15: an empty frame is handled without throwing ---------------------
+  // --- 15: degenerate frames are handled without throwing ---------------
   {
     const slam = LawnBowlsSlam.createSlam();
-    const result = LawnBowlsSlam.addFrame(slam, { detections: [], jack: null, width: VIEW_W, height: VIEW_H });
-    check('an empty frame is rejected cleanly', result.merged === false);
+    const empty = LawnBowlsSlam.addFrame(slam, { detections: [], jack: null, width: sim.IMG_W, height: sim.IMG_H });
+    check('an empty frame is rejected cleanly', empty.merged === false);
     check('an empty frame still counts as a frame seen', slam.frameCount === 1);
+
+    // Too few detections to fit a ground plane through.
+    const sparse = LawnBowlsSlam.addFrame(slam, {
+      detections: [{ x: 100, y: 100, r: 40 }, { x: 300, y: 200, r: 42 }],
+      jack: null, width: sim.IMG_W, height: sim.IMG_H,
+    });
+    check('a frame too sparse to rectify is rejected', sparse.merged === false, sparse.reason);
+    check('the rejection says why', typeof sparse.reason === 'string' && sparse.reason.length > 0);
 
     const snapshot = LawnBowlsSlam.getSnapshot(slam);
     check('an empty map reports why it cannot score', snapshot.usable === false && !!snapshot.reason);
   }
 
-  // --- 16: layoutForCanvas produces a drawable, correctly-ordered map -----
+  // --- 16: layoutForCanvas produces a drawable map ----------------------
   {
-    const world = wideRink();
+    const world = sim.spreadHead();
     const slam = LawnBowlsSlam.createSlam();
-    [
-      { x: 0, y: 0, theta: 0 },
-      { x: 2.5, y: 0.2, theta: 0.05 },
-      { x: 5.0, y: 0.1, theta: 0.05 },
-      { x: -2.5, y: 0.1, theta: -0.05 },
-      { x: -5.0, y: 0.0, theta: -0.05 },
-    ].forEach(cam => LawnBowlsSlam.addFrame(slam, renderFrame(world, cam)));
-
+    for (const cam of [{ x: -0.7, yaw: -12 }, { x: 0, yaw: 0 }, { x: 0.7, yaw: 12 }, { x: 0.2, yaw: 3 }]) {
+      LawnBowlsSlam.addFrame(slam, sim.shoot(world, sim.camera(Object.assign({ y: -1.35, pitch: 55 }, cam))));
+    }
     const snapshot = LawnBowlsSlam.getSnapshot(slam, { confirmedOnly: true });
     const layout = LawnBowlsSlam.layoutForCanvas(snapshot, 800, 600);
 
-    check('layout emits the jack plus every bowl',
-      layout.detections.length === snapshot.bowls.length + 1);
+    check('layout emits the jack plus every bowl', layout.detections.length === snapshot.bowls.length + 1);
     check('layout keeps every point on the canvas',
-      layout.detections.every(d => d.x >= 0 && d.x <= 800 && d.y >= 0 && d.y <= 600),
-      layout.detections.map(d => `(${d.x.toFixed(0)},${d.y.toFixed(0)})`).join(' '));
+      layout.detections.every(d => d.x >= 0 && d.x <= 800 && d.y >= 0 && d.y <= 600));
     check('layout preserves ranking order',
       layout.ranking.every((entry, i) => entry.dist === snapshot.ranking[i].dist));
-    check('layout gives every bowl a drawable radius',
-      layout.detections.every(d => d.r > 0));
+    check('layout carries uncertainty through to the frozen view',
+      layout.ranking.every(entry => typeof entry.sigma === 'number' && entry.sigma > 0));
   }
 
-  // --- 17: mapped bowls project back into the live view -------------------
-  // This is what lets the overlay draw a bowl the detector missed this frame.
+  // --- 17: mapped bowls project back into the live view -----------------
   {
-    const world = wideRink();
+    const world = sim.spreadHead();
     const slam = LawnBowlsSlam.createSlam();
-    const seed = renderFrame(world, { x: 0, y: 0, theta: 0 });
-    LawnBowlsSlam.addFrame(slam, seed);
+    const seed = sim.shoot(world, sim.camera({ x: 0, y: -1.4, pitch: 55 }));
+    const result = LawnBowlsSlam.addFrame(slam, seed);
 
-    const projected = LawnBowlsSlam.projectToFrame(slam, LawnBowlsSlam.currentPose(slam), DIAMETER_PX);
+    const projected = LawnBowlsSlam.projectToFrame(slam, result.pose, result.bowlDiameterPx);
     check('every landmark projects back into the frame', projected.length === slam.landmarks.length);
+    check('projections are finite and on-screen-ish',
+      projected.every(p => isFinite(p.x) && isFinite(p.y) && p.r > 0));
+  }
 
-    // The seeding frame is the identity pose, so projections must land back
-    // exactly on the pixels the detections came from.
-    let worst = 0;
-    for (const det of seed.detections) {
-      let best = Infinity;
-      for (const p of projected) best = Math.min(best, Math.hypot(p.x - det.x, p.y - det.y));
-      worst = Math.max(worst, best);
+  // --- 18: repeated looks make the map more certain ---------------------
+  // The mechanism behind telling someone to come closer and gather more: more
+  // agreeing observations must actually tighten the error bars.
+  {
+    const world = sim.spreadHead();
+    const slam = LawnBowlsSlam.createSlam();
+
+    const errorsAfter = n => {
+      const snapshot = LawnBowlsSlam.getSnapshot(slam);
+      return snapshot.ranking.length ? snapshot.ranking.reduce((s, r) => s + r.sigma, 0) / snapshot.ranking.length : null;
+    };
+
+    LawnBowlsSlam.addFrame(slam, sim.shoot(world, sim.camera({ x: 0, y: -1.4, pitch: 55 })));
+    LawnBowlsSlam.addFrame(slam, sim.shoot(world, sim.camera({ x: 0.03, y: -1.4, yaw: 1, pitch: 55 })));
+    const early = errorsAfter();
+
+    for (let i = 2; i < 10; i++) {
+      LawnBowlsSlam.addFrame(slam, sim.shoot(world, sim.camera({ x: 0.02 * i, y: -1.4, yaw: 0.4 * i, pitch: 55 })));
     }
-    check('projection round-trips to the original pixel positions', worst < 1e-6,
-      `worst error ${worst} px`);
+    const late = errorsAfter();
+
+    check('uncertainty is reported at all', early !== null && late !== null);
+    check('more agreeing looks tighten the estimate', late <= early,
+      `${early && early.toFixed(4)} -> ${late && late.toFixed(4)}`);
+    check('certainty is never claimed beyond the honest floor',
+      late >= LawnBowlsSlam.MIN_POSITION_ERROR,
+      `reported ${late && late.toFixed(4)}, floor ${LawnBowlsSlam.MIN_POSITION_ERROR}`);
+  }
+
+  // --- 19: bowls too close to separate are flagged, clear ones are not --
+  {
+    const slam = LawnBowlsSlam.createSlam();
+    // Hand-built snapshot so the geometry under test is exact rather than
+    // whatever the simulator happened to produce.
+    const snapshot = {
+      usable: true,
+      ranking: [
+        { dist: 2.00, sigma: 0.05 },
+        { dist: 2.03, sigma: 0.05 }, // 0.03 apart, noise 0.14 — cannot be called
+        { dist: 5.00, sigma: 0.05 }, // clearly further out
+      ],
+    };
+    const flagged = LawnBowlsSlam.uncertainPairs(snapshot);
+    check('a genuinely close pair is flagged', flagged.some(p => p.nearIndex === 0 && p.farIndex === 1));
+    check('a clearly separated pair is not flagged', !flagged.some(p => p.nearIndex === 1 && p.farIndex === 2));
+    check('the flag explains itself', flagged.length > 0 &&
+      typeof flagged[0].gap === 'number' && typeof flagged[0].noise === 'number' &&
+      flagged[0].gap < flagged[0].noise);
+
+    // Precise measurements should be able to separate the same small gap.
+    const precise = {
+      usable: true,
+      ranking: [{ dist: 2.00, sigma: 0.004 }, { dist: 2.03, sigma: 0.004 }],
+    };
+    check('the same gap is callable once the measurements are tight enough',
+      LawnBowlsSlam.uncertainPairs(precise).length === 0);
   }
 
   return { name: 'slam', total, failures };

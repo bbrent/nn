@@ -137,6 +137,10 @@
   // is a rough starting estimate pending real-photo data; see
   // test/fixtures/real/.
   const TIE_EPSILON = 0.15;
+  // Standard errors the two deciding bowls must be apart before their order is
+  // trusted, when the map reports how precisely it measured them. Two is
+  // roughly 95% confidence.
+  const TIE_SIGMAS = 2;
 
   // Real lawn bowls scoring: a team's score is how many of its bowls sit
   // closer to the jack than the other team's closest bowl. Since assignments
@@ -152,6 +156,7 @@
   // measurement can resolve, so the result is flagged tooClose rather than
   // stated as certain.
   function computeScore(ranking, assignments, epsilon) {
+    const explicitEpsilon = epsilon;
     if (epsilon === undefined) epsilon = TIE_EPSILON;
 
     if (assignments.length === 0) {
@@ -171,8 +176,31 @@
       } else if (team === null) {
         return { team: leadTeam, count, pending: true, tooClose: false };
       } else {
-        const gap = ranking[i].dist - ranking[i - 1].dist;
-        return { team: leadTeam, count, pending: false, tooClose: gap < epsilon };
+        // The run ends here, so these two bowls decide the score and they are
+        // the only pair whose order actually has to be trusted.
+        const nearer = ranking[i - 1];
+        const further = ranking[i];
+        const gap = further.dist - nearer.dist;
+
+        // Prefer the map's own measured uncertainty over the fixed guess when
+        // it is available: how far apart two bowls must be before their order
+        // can be believed depends on how precisely they were actually
+        // measured, not on a constant chosen in advance. An explicit epsilon
+        // still wins, so callers can force a particular tolerance.
+        const measured = nearer.sigma !== undefined && further.sigma !== undefined
+          ? TIE_SIGMAS * Math.hypot(nearer.sigma, further.sigma)
+          : null;
+        const threshold = explicitEpsilon !== undefined ? explicitEpsilon : (measured === null ? epsilon : measured);
+
+        return {
+          team: leadTeam,
+          count,
+          pending: false,
+          tooClose: gap < threshold,
+          gap,
+          threshold,
+          contested: gap < threshold ? [i - 1, i] : null,
+        };
       }
     }
     return { team: leadTeam, count, pending: false, tooClose: false };
@@ -184,6 +212,7 @@
     CONFIDENT_JACK_WORK_RADIUS_PX,
     JACK_TO_NEAREST_BOWL_RATIO,
     TIE_EPSILON,
+    TIE_SIGMAS,
     detectCircles,
     classifyAndRank,
     detectAndRank,

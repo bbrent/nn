@@ -5,11 +5,21 @@
 // sports-ball/bowl classes. computeScore is still shared from detection.js
 // (pure ranking-list logic, detector-agnostic).
 //
-// Mapping is slam.js, which estimates the camera's pose for every frame and
-// merges them all into one map. It replaces fusion.js, whose jack-anchored
-// alignment required the jack to be visible in every single frame — the
-// reason a real scan mostly came back blank. Now the jack only has to be seen
-// once, and only because the score is measured from it.
+// Each frame is then rectified onto the green by ground.js, which reads every
+// bowl's distance from how large it appears, and mapped by slam.js, which
+// works out where the camera was and merges every frame into one map.
+//
+// Together those replace fusion.js, which measured straight off the image and
+// pinned each frame to the jack. Both were wrong in ways that mattered: the
+// jack had to be visible in every single frame, which is why a real scan
+// mostly came back blank, and treating the image as a top-down view
+// foreshortened the far side of the head enough to invert which bowl was
+// closest at any realistic phone angle. Now the jack need only be seen once,
+// and distances hold up whatever angle the phone is held at.
+//
+// The map also reports how precisely it measured each bowl, so when two are
+// closer together than the scan can actually separate, the app says so and
+// says which ones to go and look at again — rather than quietly picking one.
 
 // Surface any uncaught error on-screen instead of failing silently — this is
 // the only way to see what went wrong on a phone with no console attached.
@@ -43,6 +53,7 @@ let registry = LawnBowlsRegistry.createRegistry(); // player roster + appearance
 let recentObservations = []; // newest first: { id, thumbnail (data URL), embedding } — feeds the registration picker
 let pickerSelection = new Set(); // observation ids currently selected in the open picker
 let resumeScanAfterPicker = false; // the picker interrupted a live scan; restart it on close
+let contested = null; // [i, j] into frozen.ranking when those two can't be told apart
 
 let video, overlay, overlayCtx, statusEl, rankingEl, scanBtn, registerBtn, registryEl;
 let pickerModal, pickerGrid, pickerConfirmBtn, pickerCancelBtn;
@@ -481,6 +492,8 @@ const JACK_COLOR = '#ffd54f';
 const UNRANKED_COLOR = '#42a5f5';
 // Deliberately neutral, so a remembered bowl never reads as a fresh detection.
 const GHOST_COLOR = '#b0bec5';
+// Ring around the two bowls the score turns on when they can't be separated.
+const CONTESTED_COLOR = '#ffa726';
 
 function drawOverlay(detections, jack, ranking, ghosts) {
   overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
@@ -620,6 +633,14 @@ const UNASSIGNED_FLAG_COLOR = '#616161';
 const ASSIGNMENT_CYCLE = [null, 'mine', 'theirs'];
 
 function renderFrozen() {
+  // Work out the score first: which two bowls (if any) are too close to call
+  // decides how they're drawn, so it has to be known before painting rather
+  // than as a side effect of writing the text afterwards.
+  const score = frozen.ranking.length
+    ? LawnBowlsDetection.computeScore(frozen.ranking, assignments)
+    : null;
+  contested = (score && score.contested) || null;
+
   // Fused positions aren't tied to whatever the camera currently sees (some
   // bowls may be out of frame by now), so this is an abstract top-down map,
   // not an overlay on the live picture — paint over the paused video feed.
@@ -640,10 +661,27 @@ function renderFrozen() {
     drawFlag(entry.bowl, i + 1, flagColor);
   });
 
-  renderScoreUI();
+  // Ring the two bowls the result actually turns on, when the measurement
+  // can't separate them. Pointing at exactly which bowls to go and look at
+  // more closely is more use than a general warning.
+  if (contested) {
+    for (const index of contested) {
+      const entry = frozen.ranking[index];
+      if (!entry) continue;
+      overlayCtx.beginPath();
+      overlayCtx.arc(entry.bowl.x, entry.bowl.y, entry.bowl.r * 1.7, 0, 2 * Math.PI);
+      overlayCtx.strokeStyle = CONTESTED_COLOR;
+      overlayCtx.lineWidth = 3;
+      overlayCtx.setLineDash([5, 4]);
+      overlayCtx.stroke();
+      overlayCtx.setLineDash([]);
+    }
+  }
+
+  renderScoreUI(score);
 }
 
-function renderScoreUI() {
+function renderScoreUI(score) {
   rankingEl.innerHTML = '';
 
   const summary = document.createElement('li');
@@ -652,7 +690,6 @@ function renderScoreUI() {
   if (frozen.ranking.length === 0) {
     summary.textContent = 'No bowls to score (only the jack was detected).';
   } else {
-    const score = LawnBowlsDetection.computeScore(frozen.ranking, assignments);
     if (score.team === null) {
       summary.textContent = "Tap the closest bowl's flag to say whose it is.";
     } else {
@@ -660,7 +697,14 @@ function renderScoreUI() {
       if (score.pending) {
         summary.textContent = `${label}: at least ${score.count} — keep tagging to confirm`;
       } else if (score.tooClose) {
-        summary.textContent = `${label}: ${score.count} — but the deciding bowls are too close to call from the scan, measure by hand`;
+        // Say which two bowls, and what to do about it. The measurement gets
+        // sharper the closer the camera is and the more looks it gets, so
+        // "go and gather more" is a real remedy rather than a shrug.
+        const [near, far] = score.contested;
+        summary.textContent =
+          `${label}: ${score.count}, but too close to call — bowls #${near + 1} and #${far + 1} are ` +
+          `${score.gap.toFixed(2)} apart and this scan is only good to ${score.threshold.toFixed(2)}. ` +
+          `Move in closer over those two and scan again, or measure by hand.`;
       } else {
         summary.textContent = `${label} score this end: ${score.count}`;
       }
@@ -672,7 +716,12 @@ function renderScoreUI() {
     const li = document.createElement('li');
     const team = assignments[i];
     const label = team === 'mine' ? 'Mine' : team === 'theirs' ? "Theirs" : 'Unassigned — tap to set';
-    li.textContent = `#${i + 1} bowl — ${entry.dist.toFixed(2)} bowl-diameters from jack — ${label}`;
+    // Report the error bar alongside the distance rather than a bare number:
+    // a figure quoted to two decimals reads as far more certain than a phone
+    // camera can honestly claim.
+    const spread = entry.sigma !== undefined ? ` ±${entry.sigma.toFixed(2)}` : '';
+    const flag = contested && (i === contested[0] || i === contested[1]) ? ' — TOO CLOSE TO CALL' : '';
+    li.textContent = `#${i + 1} bowl — ${entry.dist.toFixed(2)}${spread} bowl-diameters from jack — ${label}${flag}`;
     li.style.cursor = 'pointer';
     li.addEventListener('click', () => cycleAssignment(i));
     rankingEl.appendChild(li);

@@ -10,24 +10,33 @@
 // another landmark: it needs to be seen once, anywhere in the scan, and only
 // because scoring is measured from it.
 //
-// The map is 2D and metric in bowl-diameters. Each frame's detections are
-// scaled by that frame's own median bowl radius, which makes the frame-to-
-// frame transform a similarity (rotation + translation + a small residual
-// scale) rather than a full projective one. That is an approximation — a
-// tilted camera really does make near bowls bigger than far ones inside a
-// single frame — but it is the same approximation the app has been using all
-// along, and averaging many frames absorbs most of it.
+// The map is 2D and metric in bowl-diameters. Frames arrive already rectified
+// onto the green by ground.js, which uses each bowl's apparent size as a depth
+// cue, so what this module aligns are true top-down positions rather than raw
+// image coordinates. That matters for more than tidiness: measuring distances
+// straight off the image assumes the phone points vertically down, and at any
+// realistic angle it foreshortens the far side of the head badly enough to
+// invert which bowl is closest — the one thing the app exists to decide.
+//
+// Because rectified coordinates are metric, the same bowl measures the same in
+// every frame no matter where the camera stood, so alignment between frames is
+// a plain rigid transform with no scale left to guess at.
+//
+// Every landmark also carries the spread of the positions it has been seen at,
+// which is what lets the app say how sure it is: two bowls whose gap is
+// smaller than that spread are reported as too close to call rather than
+// silently ranked.
 //
 // Shared with the browser app (window.LawnBowlsSlam) and the Node test
 // harness (synthetic frame sequences, no images or camera involved).
 
 (function (root, factory) {
   if (typeof module === 'object' && module.exports) {
-    module.exports = factory();
+    module.exports = factory(require('./ground.js'));
   } else {
-    root.LawnBowlsSlam = factory();
+    root.LawnBowlsSlam = factory(root.LawnBowlsGround);
   }
-})(typeof self !== 'undefined' ? self : this, function () {
+})(typeof self !== 'undefined' ? self : this, function (LawnBowlsGround) {
   // How close a projected landmark and a detection must be (bowl-diameters)
   // to be treated as the same thing when estimating a pose.
   const ASSOC_GATE = 0.55;
@@ -41,11 +50,13 @@
   // A two-point hypothesis with a short baseline gives a wildly unstable
   // rotation (tiny position noise swings the angle), so require some spread.
   const MIN_BASELINE = 0.8;
-  // Frame-to-frame scale should stay near 1 — the camera moving closer or
-  // further changes apparent size gradually. Anything outside this is a
-  // mis-association explaining itself away by shrinking the world.
-  const MIN_SCALE = 0.6;
-  const MAX_SCALE = 1.6;
+  // Rectified coordinates are metric in bowl-diameters, set by the bowls'
+  // real size, so the same bowl measures the same in every frame and the
+  // frame-to-frame scale should sit at 1. The tolerance left here covers
+  // detection noise and a guessed focal length, nothing more; anything beyond
+  // it is a mis-association explaining itself away by resizing the world.
+  const MIN_SCALE = 0.85;
+  const MAX_SCALE = 1.18;
   // Observations before a landmark is trusted as a real bowl rather than a
   // one-off false positive (a shoe, a hand, a bag).
   const CONFIRM_OBSERVATIONS = 3;
@@ -67,12 +78,43 @@
   // placing the camera, so it takes a frame that found most of what it
   // expected. Otherwise one bad detection frame would start deleting real
   // bowls that were sitting in plain view the whole time.
-  const MIN_EXPLAINED_FOR_PRUNE = 0.6;
+  const MIN_EXPLAINED_FOR_PRUNE = 0.8;
   // Relocalisation has no prior to lean on, so a two-point fit there is a
   // coincidence waiting to happen; while tracking, the previous pose already
   // rules out everything except a near-continuation of it.
   const MIN_INLIERS_TRACKING = 2;
   const MIN_INLIERS_RELOCALISING = 3;
+  // Floor on how precisely a position is ever claimed to be known, in
+  // bowl-diameters (~5mm on a 125mm bowl). Repeated looks that happen to agree
+  // shrink the measured spread toward zero, but the errors that do not average
+  // out — a guessed focal length, a detector that centres slightly off — are
+  // still there. Claiming sub-millimetre certainty from a phone camera would
+  // be a lie, and the whole point of this number is to be honest about when to
+  // reach for the measure instead.
+  const MIN_POSITION_ERROR = 0.04;
+  // A landmark seen once has no measurable spread at all. That is not
+  // precision, it is ignorance, so it is treated as very uncertain until a
+  // second look either confirms or contradicts it.
+  const UNMEASURED_POSITION_ERROR = 0.5;
+  // How many standard errors two bowls must be apart before their order is
+  // called rather than flagged. Two is roughly 95% confidence.
+  const CONFIDENCE_SIGMAS = 2;
+  // How badly a frame's detections may fail to lie on one plane before the
+  // frame is thrown out. Bowls on a green are coplanar by definition, so a
+  // large residual means something in the frame isn't what it was taken for —
+  // most importantly a bowl mislabelled as the jack, which gets scaled to the
+  // wrong depth and drags the whole fit with it.
+  //
+  // Calibrated by simulation rather than guessed: legitimate frames sit at
+  // 0.02-0.06 with realistic detector noise (p95 ~0.10, rising to ~0.16 when
+  // noise is heavy), while a bowl mislabelled as the jack sits around 0.26.
+  // The gap is real but not wide enough for a tight gate without field data,
+  // so this is deliberately lenient and only catches egregious cases. Milder
+  // distortion needs no gate of its own: a frame with skewed geometry
+  // contributes positions that disagree with the others, which widens the
+  // measured spread and shows up as lower confidence — which is the honest
+  // outcome anyway.
+  const MAX_PLANE_RESIDUAL = 0.3;
 
   function createSlam() {
     return {
@@ -239,18 +281,36 @@
   // Landmarks that this frame's field of view says should have been visible.
   // Having a real pose is what makes this possible at all — the old jack-
   // anchored fusion had to guess with a fixed radius around matched points.
-  function landmarksInView(landmarks, pose, view) {
+  // Pruning exists to clear out things that were never bowls — a shoe, a bag,
+  // a passing hand caught once or twice. It is not a mechanism for removing
+  // bowls that are genuinely there, so two kinds of landmark are exempt.
+  //
+  // A landmark confirmed by several independent looks is not a false positive
+  // by definition, and deleting it because the detector had a poor run costs
+  // a real bowl for no gain. If a bowl truly is moved mid-end, a fresh scan is
+  // the right remedy, not silent deletion during this one.
+  //
+  // The jack is exempt outright. It is half a bowl across and correspondingly
+  // easy to miss, so its misses carry far less meaning than a bowl's — and
+  // losing it costs the whole score rather than one position, since every
+  // distance is measured from it. That asymmetry makes protecting it the only
+  // sensible default, and it is what makes "look at the jack once" a promise
+  // the app can actually keep.
+  function isPrunable(landmark) {
+    if (landmark.jackVotes > 0) return false;
+    return landmark.observations < CONFIRM_OBSERVATIONS;
+  }
+
+  // Landmarks lying inside the patch of green this frame actually covered.
+  // An empty footprint means the view was too oblique to bound (the horizon
+  // was in shot), and the honest answer there is that nothing can be
+  // concluded about what was or wasn't visible — so nothing is.
+  function landmarksInView(landmarks, pose, footprint) {
+    if (!footprint) return [];
     const inView = [];
     for (let j = 0; j < landmarks.length; j++) {
       const local = applyInversePose(pose, landmarks[j]);
-      if (
-        local.x >= VIEW_MARGIN &&
-        local.y >= VIEW_MARGIN &&
-        local.x <= view.width - VIEW_MARGIN &&
-        local.y <= view.height - VIEW_MARGIN
-      ) {
-        inView.push(j);
-      }
+      if (LawnBowlsGround.containsPoint(footprint, local)) inView.push(j);
     }
     return inView;
   }
@@ -259,8 +319,8 @@
   // actually matched. A pose that says "twelve mapped bowls are in shot" but
   // only lines up with two of them has almost certainly locked onto a
   // coincidence, and merging it would corrupt the map.
-  function explainedFraction(pairs, localPoints, landmarks, pose, view) {
-    const expected = landmarksInView(landmarks, pose, view);
+  function explainedFraction(pairs, localPoints, landmarks, pose, footprint) {
+    const expected = landmarksInView(landmarks, pose, footprint);
     if (expected.length === 0) return 1;
     const matched = new Set(pairs.map(p => p.landmarkIndex));
     let hits = 0;
@@ -268,7 +328,7 @@
     return hits / expected.length;
   }
 
-  function poseQuality(pairs, localPoints, landmarks, pose, view, minInliers) {
+  function poseQuality(pairs, localPoints, landmarks, pose, footprint, minInliers) {
     if (pairs.length < minInliers) return null;
     // Two-point poses ride entirely on their baseline; a short one is noise.
     if (pairs.length === 2) {
@@ -276,7 +336,7 @@
       const b = localPoints[pairs[1].localIndex];
       if (Math.hypot(a.x - b.x, a.y - b.y) < MIN_BASELINE) return null;
     }
-    const explained = explainedFraction(pairs, localPoints, landmarks, pose, view);
+    const explained = explainedFraction(pairs, localPoints, landmarks, pose, footprint);
     if (explained < MIN_EXPLAINED_FOR_POSE) return null;
     const residual = pairs.reduce((s, p) => s + p.dist, 0) / pairs.length;
     // Prefer more correspondences first, then tighter ones.
@@ -288,14 +348,14 @@
   // bounded RANSAC over pairwise correspondences when tracking fails —
   // which is what lets the camera be swung away and brought back without
   // having to restart the scan.
-  function estimatePose(localPoints, landmarks, priorPose, view) {
+  function estimatePose(localPoints, landmarks, priorPose, footprint) {
     let best = null;
     let bestQuality = -Infinity;
 
     function consider(candidate, minInliers) {
       if (!candidate) return;
       const refined = refinePose(localPoints, landmarks, candidate, 3);
-      const quality = poseQuality(refined.pairs, localPoints, landmarks, refined.pose, view, minInliers);
+      const quality = poseQuality(refined.pairs, localPoints, landmarks, refined.pose, footprint, minInliers);
       if (quality !== null && quality > bestQuality) {
         bestQuality = quality;
         best = refined;
@@ -344,27 +404,45 @@
 
   // --- frame ingestion ----------------------------------------------------
 
-  // Converts image-pixel detections into this frame's local coordinates,
-  // measured in bowl-diameters. Scaling by the frame's own median bowl radius
-  // is what keeps the transform between frames close to rigid even as the
-  // camera moves nearer or further.
-  function toLocalFrame(detections, jack, viewWidth, viewHeight) {
-    const bowlRadii = detections.filter(d => d !== jack).map(d => d.r).sort((p, q) => p - q);
-    if (bowlRadii.length === 0) return null;
-    const medianRadius = bowlRadii[Math.floor(bowlRadii.length / 2)];
-    if (!(medianRadius > 0)) return null;
+  // Converts image-pixel detections into this frame's local coordinates, by
+  // rectifying them onto the green (see ground.js). The result is metric in
+  // bowl-diameters and genuinely top-down, so distances mean the same thing
+  // wherever the camera was standing.
+  //
+  // A frame the rectifier can't place is rejected outright rather than falling
+  // back to the old "divide everything by one median radius" scaling. Those
+  // two conventions describe different spaces — one is the ground, the other
+  // is the image plane — and quietly mixing them in a single map would put
+  // bowls in positions that belong to neither.
+  function toLocalFrame(detections, jack, viewWidth, viewHeight, focalLength) {
+    const rectified = LawnBowlsGround.rectify(detections, jack, {
+      width: viewWidth,
+      height: viewHeight,
+      focalLength,
+      insetDiameters: VIEW_MARGIN,
+    });
+    if (!rectified.ok) return { ok: false, reason: rectified.reason };
+    if (rectified.residual > MAX_PLANE_RESIDUAL) {
+      return { ok: false, reason: "this view doesn't sit flat on the green — something in it isn't a bowl" };
+    }
 
-    const diameter = medianRadius * 2;
-    const points = detections.map(d => ({
-      x: d.x / diameter,
-      y: d.y / diameter,
-      isJack: d === jack,
-      identity: d.identity || null,
-    }));
+    const bowlRadii = detections.filter(d => d !== jack && d.r > 0).map(d => d.r).sort((p, q) => p - q);
+    const medianRadius = bowlRadii.length ? bowlRadii[Math.floor(bowlRadii.length / 2)] : 0;
+
     return {
-      points,
-      diameter,
-      view: { width: viewWidth / diameter, height: viewHeight / diameter },
+      ok: true,
+      points: rectified.points.map(p => ({
+        x: p.x,
+        y: p.y,
+        isJack: p.detection === jack,
+        identity: p.detection.identity || null,
+      })),
+      footprint: rectified.footprint,
+      tilt: rectified.tilt,
+      residual: rectified.residual,
+      // Kept only so the live overlay can draw mapped bowls back at the right
+      // apparent size; the map itself no longer depends on it.
+      diameter: medianRadius * 2,
     };
   }
 
@@ -386,9 +464,9 @@
       return { merged: false, reason: 'nothing detected in this frame' };
     }
 
-    const local = toLocalFrame(detections, frame.jack, frame.width, frame.height);
-    if (!local) {
-      return { merged: false, reason: 'no bowl to set the scale from' };
+    const local = toLocalFrame(detections, frame.jack, frame.width, frame.height, frame.focalLength);
+    if (!local.ok) {
+      return { merged: false, reason: local.reason };
     }
 
     if (slam.landmarks.length === 0) {
@@ -399,6 +477,7 @@
           y: p.y,
           observations: 1,
           misses: 0,
+          m2: 0,
           jackVotes: p.isJack ? 1 : 0,
           identity: p.identity,
         });
@@ -417,7 +496,7 @@
       };
     }
 
-    const estimate = estimatePose(local.points, slam.landmarks, slam.lastPose, local.view);
+    const estimate = estimatePose(local.points, slam.landmarks, slam.lastPose, local.footprint);
     if (!estimate.ok) {
       return { merged: false, reason: estimate.reason };
     }
@@ -445,10 +524,18 @@
 
       if (bestIndex >= 0) {
         const landmark = slam.landmarks[bestIndex];
-        const n = landmark.observations;
-        landmark.x = (landmark.x * n + wp.x) / (n + 1);
-        landmark.y = (landmark.y * n + wp.y) / (n + 1);
-        landmark.observations = n + 1;
+        // Welford: keeps the running mean and the spread around it in one
+        // pass, numerically stable. The spread is what lets the app say how
+        // sure it is — repeated looks that agree tighten the estimate, ones
+        // that disagree widen it, and both are real information about whether
+        // a close call can be trusted.
+        const n = landmark.observations + 1;
+        const dx = wp.x - landmark.x;
+        const dy = wp.y - landmark.y;
+        landmark.x += dx / n;
+        landmark.y += dy / n;
+        landmark.m2 += dx * (wp.x - landmark.x) + dy * (wp.y - landmark.y);
+        landmark.observations = n;
         landmark.misses = 0;
         if (p.isJack) landmark.jackVotes++;
         // Identity is sticky and only ever upgraded: one frame's crop
@@ -463,6 +550,7 @@
           y: wp.y,
           observations: 1,
           misses: 0,
+          m2: 0,
           jackVotes: p.isJack ? 1 : 0,
           identity: p.identity,
         });
@@ -480,7 +568,7 @@
     // the bowls actually in view, the honest reading is "this frame saw
     // poorly", not "those bowls are gone" — charging misses there would
     // quietly delete real bowls sitting in plain sight.
-    const expected = landmarksInView(slam.landmarks, pose, local.view);
+    const expected = landmarksInView(slam.landmarks, pose, local.footprint);
     const expectedHits = expected.filter(j => seen.has(j)).length;
     const informative = expected.length === 0 || expectedHits / expected.length >= MIN_EXPLAINED_FOR_PRUNE;
 
@@ -491,7 +579,7 @@
         if (seen.has(j)) continue;
         const landmark = slam.landmarks[j];
         landmark.misses++;
-        if (landmark.misses >= MISS_THRESHOLD) {
+        if (landmark.misses >= MISS_THRESHOLD && isPrunable(landmark)) {
           doomed.add(j);
           removedLandmarks++;
         }
@@ -530,6 +618,36 @@
     return best;
   }
 
+  // How far a landmark's averaged position might still be off, in
+  // bowl-diameters — the standard error of the mean of everywhere it has been
+  // seen. Looks that agree pull it down; looks that disagree push it up; more
+  // looks shrink it as 1/sqrt(n), which is why moving in closer and gathering
+  // more of them is genuinely worth telling someone to do.
+  function positionError(landmark) {
+    if (!landmark || landmark.observations < 2) return UNMEASURED_POSITION_ERROR;
+    const variance = Math.max(landmark.m2, 0) / (landmark.observations - 1);
+    return Math.max(Math.sqrt(variance / landmark.observations), MIN_POSITION_ERROR);
+  }
+
+  // Adjacent bowls in the ranking whose order the measurements cannot actually
+  // separate. This is what turns "the app says you're up by one" into "these
+  // two are too close to call from here" — the honest answer, and the same one
+  // a player would reach for the measure over.
+  function uncertainPairs(snapshot, opts) {
+    const sigmas = (opts && opts.sigmas) || CONFIDENCE_SIGMAS;
+    const pairs = [];
+    for (let i = 0; i + 1 < snapshot.ranking.length; i++) {
+      const near = snapshot.ranking[i];
+      const far = snapshot.ranking[i + 1];
+      const gap = far.dist - near.dist;
+      const noise = sigmas * Math.hypot(near.sigma, far.sigma);
+      if (gap < noise) {
+        pairs.push({ nearIndex: i, farIndex: i + 1, gap, noise, near, far });
+      }
+    }
+    return pairs;
+  }
+
   // Bowls ranked by distance from the jack, shaped like a detectAndRank()
   // result so the same UI and scoring code consumes either.
   // confirmedOnly drops landmarks seen fewer than CONFIRM_OBSERVATIONS times,
@@ -555,10 +673,15 @@
       };
     }
 
+    // Distance uncertainty carries the jack's own error as well as the bowl's:
+    // everything is measured from the jack, so if it is loosely placed then
+    // every distance taken from it is loose too.
+    const jackError = positionError(jack);
     const ranking = bowls
       .map(b => ({
         bowl: b,
         dist: Math.hypot(b.x - jack.x, b.y - jack.y),
+        sigma: Math.hypot(positionError(b), jackError),
         confirmed: b.observations >= CONFIRM_OBSERVATIONS,
       }))
       .sort((a, b) => a.dist - b.dist);
@@ -612,7 +735,7 @@
 
     const ranking = snapshot.ranking.map(entry => {
       const idx = snapshot.bowls.indexOf(entry.bowl);
-      return { bowl: bowlPoints[idx], dist: entry.dist, confirmed: entry.confirmed };
+      return { bowl: bowlPoints[idx], dist: entry.dist, sigma: entry.sigma, confirmed: entry.confirmed };
     });
 
     return { detections, jack, ranking };
@@ -657,6 +780,10 @@
     MIN_EXPLAINED_FOR_PRUNE,
     MIN_INLIERS_TRACKING,
     MIN_INLIERS_RELOCALISING,
+    MIN_POSITION_ERROR,
+    UNMEASURED_POSITION_ERROR,
+    CONFIDENCE_SIGMAS,
+    MAX_PLANE_RESIDUAL,
     IDENTITY_POSE,
     createSlam,
     applyPose,
@@ -667,6 +794,8 @@
     estimatePose,
     addFrame,
     getSnapshot,
+    positionError,
+    uncertainPairs,
     layoutForCanvas,
     currentPose,
     projectToFrame,
