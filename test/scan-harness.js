@@ -154,7 +154,8 @@ async function main() {
       console.log(
         `  ${String(i).padStart(2)}   ${String(f.visible).padStart(5)}   ${String(f.found).padStart(4)}` +
         `   ${String(f.spurious).padStart(6)}   ${f.jackFound ? ' y' : ' n'}    ${f.classifierUsable ? ' y' : ' n'}` +
-        `      ${f.merged ? 'y' : 'NO — ' + f.mergeReason}`
+        `      ${f.merged ? 'y' : 'NO — ' + f.mergeReason}` +
+        (f.merged ? `  scale=${f.poseScale} matched=${f.matched} new=${f.newLandmarks}${f.carriedPlane ? ' CARRIED' : ''}` : '')
       );
     });
 
@@ -202,7 +203,14 @@ async function main() {
     // have found every bowl, so a positional comparison would misalign.
     const remaining = trueDistances.slice();
     const errors = [];
+    const unmatched = [];
     for (const value of measured) {
+      if (!remaining.length) {
+        // More bowls on the map than exist — whatever these are, they are not
+        // real, and there is no truth to compare them against.
+        unmatched.push(value);
+        continue;
+      }
       let bestIndex = 0;
       let bestError = Infinity;
       remaining.forEach((t, i) => {
@@ -212,6 +220,10 @@ async function main() {
       const matched = remaining.splice(bestIndex, 1)[0];
       errors.push({ name: matched.name, measured: value, truth: matched.dist, error: bestError });
     }
+    if (unmatched.length) {
+      console.log(`\n  ${unmatched.length} bowl(s) on the map that do not exist, at ` +
+        unmatched.map(v => v.toFixed(2)).join(', ') + ' from the jack');
+    }
 
     console.log('\nDistance from jack (bowl-diameters):');
     console.log('  bowl   measured   ±sigma    true     error');
@@ -220,6 +232,7 @@ async function main() {
       .sort((a, b) => a.dist - b.dist)
       .forEach((r, i) => {
         const e = errors[i];
+        if (!e) return;
         console.log(`  ${e.name.padEnd(5)}  ${e.measured.toFixed(3).padStart(7)}   ${r.sigma.toFixed(3)}` +
           `   ${e.truth.toFixed(3).padStart(6)}  ${e.error.toFixed(3).padStart(7)}`);
       });

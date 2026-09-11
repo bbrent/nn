@@ -210,6 +210,10 @@ window.runScan = async function (path) {
       merged: merged.merged,
       mergeReason: merged.reason,
       relocalised: !!merged.relocalised,
+      carriedPlane: !!merged.carriedPlane,
+      poseScale: merged.pose ? Math.round(merged.pose.scale*1000)/1000 : null,
+      matched: merged.matched || 0,
+      newLandmarks: merged.newLandmarks || 0,
       ...detectionQuality,
     });
   }

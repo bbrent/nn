@@ -289,18 +289,24 @@ async function processFrame() {
 
     const result = await LawnBowlsYolo.detectAndRank(ort, yoloSession, imageData640, letterbox);
 
-    // Native-resolution frame to crop bowls from — the 640x640 letterboxed
-    // one is too downscaled for a clean embedding crop. Embed every raw
-    // detection (capped) once: this both feeds the registration picker's
-    // "recently seen" thumbnails and attaches each bowl's player identity
-    // for the map to carry.
-    frameCtx.drawImage(video, 0, 0, frameCanvas.width, frameCanvas.height);
-    for (const d of result.detections.slice(0, MAX_DETECTIONS_EMBEDDED_PER_FRAME)) {
-      const crop = cropBowlImageData(frameCanvas, d);
-      if (!crop) continue;
-      const embedding = await LawnBowlsEmbedding.embedCrop(ort, embeddingSession, crop);
-      d.identity = LawnBowlsRegistry.matchBowl(registry, embedding);
-      recordObservation(embedding);
+    // Work out who each bowl belongs to — but only when there is somebody to
+    // match it against. Recognising a bowl's owner costs a separate neural
+    // network run per bowl, and measured in a browser that is 35ms each
+    // against 382ms for the detection itself: fifteen bowls in a frame turned
+    // 382ms into 913ms, dropping the scan from 2.6 frames a second to 1.1.
+    // With an empty registry every one of those runs was thrown away, and the
+    // cost landed as bowls taking well over twice as long to appear. The
+    // picker fills its own gallery while it is open, so nothing here is needed
+    // for that either.
+    if (registry.players.length > 0) {
+      frameCtx.drawImage(video, 0, 0, frameCanvas.width, frameCanvas.height);
+      for (const d of result.detections.slice(0, MAX_DETECTIONS_EMBEDDED_PER_FRAME)) {
+        const crop = cropBowlImageData(frameCanvas, d);
+        if (!crop) continue;
+        const embedding = await LawnBowlsEmbedding.embedCrop(ort, embeddingSession, crop);
+        d.identity = LawnBowlsRegistry.matchBowl(registry, embedding);
+        recordObservation(embedding);
+      }
     }
 
     // Every frame goes into the map, including ones with no jack in shot and

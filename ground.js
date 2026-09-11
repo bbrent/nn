@@ -74,6 +74,11 @@
   // A plane needs three points, and three exactly-determined ones fit any
   // arrangement perfectly with no way to tell a good fit from a bad one.
   const MIN_POINTS_FOR_PLANE = 4;
+  // With the green's orientation already known from an earlier frame, far less
+  // is needed: two bowls fix where it sits along the line of sight, and are
+  // also enough to notice if the phone has turned so far that the remembered
+  // orientation no longer applies.
+  const MIN_POINTS_WITH_PRIOR = 2;
   // Beyond this the view is so oblique that depth resolution collapses and
   // the recovered geometry should not be trusted for close calls.
   const STEEP_TILT_DEGREES = 70;
@@ -295,6 +300,18 @@
     return { plane, inliers: best.inliers };
   }
 
+  // RMS distance of a set of recovered points from their own centre, in
+  // bowl-diameters — how much of the green they actually cover.
+  function spreadOf(points) {
+    if (!points.length) return 0;
+    let cx = 0, cy = 0, cz = 0;
+    for (const p of points) { cx += p.x; cy += p.y; cz += p.z; }
+    cx /= points.length; cy /= points.length; cz /= points.length;
+    const sum = points.reduce((acc, p) =>
+      acc + (p.x - cx) ** 2 + (p.y - cy) ** 2 + (p.z - cz) ** 2, 0);
+    return Math.sqrt(sum / points.length) / 2; // radii -> diameters
+  }
+
   // Right-handed orthonormal basis spanning the plane. The in-plane axes are
   // arbitrary but the handedness is not — deriving the second axis from the
   // cross product with the normal keeps every frame's coordinates the same
@@ -397,9 +414,12 @@
     const height = opts.height;
     const focal = opts.focalLength || defaultFocalLength(width, height);
 
+    // How many detections are enough depends on whether the green's
+    // orientation is already known, so the real test belongs further down
+    // where that is decided. All this needs to rule out is an empty frame.
     const usable = (detections || []).filter(d => d.r > 0);
-    if (usable.length < MIN_POINTS_FOR_PLANE) {
-      return { ok: false, reason: 'too few detections to work out the ground plane', points: [], focalLength: focal };
+    if (usable.length === 0) {
+      return { ok: false, reason: 'nothing detected in this frame', points: [], focalLength: focal };
     }
 
     // The green is defined by the bowls alone. They are all the same real size,
@@ -412,16 +432,49 @@
     // for that to matter. Feeding it in on the wrong ratio pushed it clear of
     // the green and got the scoring reference thrown out of its own frame.
     const bowlDetections = usable.filter(d => d !== jack);
-    if (bowlDetections.length < MIN_POINTS_FOR_PLANE) {
+    const recovered = recover3D(bowlDetections, focal, width, height);
+
+    let plane;
+    let spatial;
+    let carriedPlane = false;
+
+    if (bowlDetections.length >= MIN_POINTS_FOR_PLANE) {
+      const fit = fitPlaneRobustly(recovered);
+      if (!fit) {
+        return { ok: false, reason: 'detections are collinear — cannot fit the ground', points: [], focalLength: focal };
+      }
+      plane = fit.plane;
+      spatial = fit.inliers;
+    } else if (opts.priorNormal && bowlDetections.length >= MIN_POINTS_WITH_PRIOR) {
+      // The green does not move or change shape between frames, so once its
+      // orientation is known there is no reason to rediscover it from scratch
+      // every time. That matters because working it out afresh needs four
+      // bowls in one shot, and a real head often shows fewer — which meant
+      // perfectly good frames were refused outright and the map took far
+      // longer to fill in than it needed to.
+      //
+      // Only the orientation carries over. Where the green sits along the line
+      // of sight comes from this frame's own bowls, since that changes as soon
+      // as the camera does.
+      const centroid = recovered.reduce((acc, p) => ({
+        x: acc.x + p.x / recovered.length,
+        y: acc.y + p.y / recovered.length,
+        z: acc.z + p.z / recovered.length,
+      }), { x: 0, y: 0, z: 0 });
+      plane = { normal: opts.priorNormal, centroid };
+
+      // Carrying it forward assumes the phone has not turned much since. The
+      // bowls this frame does have are enough to check that: if they do not sit
+      // on the remembered green, it is the wrong green and the frame is better
+      // refused than quietly placed against it.
+      if (planeResidual(recovered, plane) > MAX_OFF_PLANE) {
+        return { ok: false, reason: 'the view has turned too far to reuse the last ground plane', points: [], focalLength: focal };
+      }
+      spatial = recovered;
+      carriedPlane = true;
+    } else {
       return { ok: false, reason: 'too few bowls to work out the ground plane', points: [], focalLength: focal };
     }
-
-    const fit = fitPlaneRobustly(recover3D(bowlDetections, focal, width, height));
-    if (!fit) {
-      return { ok: false, reason: 'detections are collinear — cannot fit the ground', points: [], focalLength: focal };
-    }
-    const plane = fit.plane;
-    const spatial = fit.inliers;
 
     // A jack is visibly smaller than a bowl. If whatever was labelled as one
     // is not, the label is wrong — the cheapest possible check, and it needs
@@ -480,6 +533,10 @@
       ok: true,
       points,
       jackRejected,
+      // Handed back so the caller can carry the green forward into frames too
+      // sparse to work it out for themselves.
+      normal: plane.normal,
+      carriedPlane,
       footprint,
       tilt: tiltDegrees(plane),
       residual: planeResidual(spatial, plane),
@@ -492,6 +549,7 @@
     MAX_JACK_RADIUS_RATIO,
     DEFAULT_FOCAL_RATIO,
     MIN_POINTS_FOR_PLANE,
+    MIN_POINTS_WITH_PRIOR,
     STEEP_TILT_DEGREES,
     MAX_OFF_PLANE,
     CONSENSUS_BUDGET,
@@ -501,6 +559,7 @@
     rayToPlane,
     planeBasis,
     planeResidual,
+    spreadOf,
     fitPlaneRobustly,
     tiltDegrees,
     groundFootprint,

@@ -134,7 +134,8 @@
 
   function createSlam() {
     return {
-      landmarks: [], // { x, y, observations, misses, jackVotes, identity }
+      landmarks: [], // { x, y, observations, misses, m2, jackVotes, identity }
+      groundNormal: null, // the green's orientation, carried into sparse frames
       poses: [], // one { x, y, theta, scale } per merged frame, in order
       lastPose: null,
       frameCount: 0,
@@ -430,12 +431,13 @@
   // two conventions describe different spaces — one is the ground, the other
   // is the image plane — and quietly mixing them in a single map would put
   // bowls in positions that belong to neither.
-  function toLocalFrame(detections, jack, viewWidth, viewHeight, focalLength) {
+  function toLocalFrame(detections, jack, viewWidth, viewHeight, focalLength, priorNormal) {
     const rectified = LawnBowlsGround.rectify(detections, jack, {
       width: viewWidth,
       height: viewHeight,
       focalLength,
       insetDiameters: VIEW_MARGIN,
+      priorNormal,
     });
     if (!rectified.ok) return { ok: false, reason: rectified.reason };
     if (rectified.residual > MAX_PLANE_RESIDUAL) {
@@ -447,6 +449,8 @@
 
     return {
       ok: true,
+      normal: rectified.normal,
+      carriedPlane: rectified.carriedPlane,
       points: rectified.points.map(p => ({
         x: p.x,
         y: p.y,
@@ -480,10 +484,15 @@
       return { merged: false, reason: 'nothing detected in this frame' };
     }
 
-    const local = toLocalFrame(detections, frame.jack, frame.width, frame.height, frame.focalLength);
+    // The green's orientation from the last frame that could work it out for
+    // itself. Handing it back lets a frame showing only two or three bowls be
+    // used instead of refused, which is most of what made the map slow to
+    // fill in.
+    const local = toLocalFrame(detections, frame.jack, frame.width, frame.height, frame.focalLength, slam.groundNormal);
     if (!local.ok) {
       return { merged: false, reason: local.reason };
     }
+    if (local.normal && !local.carriedPlane) slam.groundNormal = local.normal;
 
     if (slam.landmarks.length === 0) {
       // First frame defines the world: its own coordinates become the map's.
@@ -560,7 +569,7 @@
           landmark.identity = p.identity;
         }
         seen.add(bestIndex);
-      } else {
+      } else if (!local.carriedPlane) {
         slam.landmarks.push({
           x: wp.x,
           y: wp.y,
@@ -573,6 +582,17 @@
         seen.add(slam.landmarks.length - 1);
         newLandmarks++;
       }
+      // A frame that had to borrow the green's orientation from an earlier one
+      // can still sharpen bowls already on the map, but it does not get to put
+      // new ones there. Such frames are the close-ups taken when the app asks
+      // for a better look at two bowls, and several of them in a row barely
+      // move — so anything the detector imagines in the turf appears in the
+      // same spot again and again and reaches the confirmation threshold
+      // looking exactly like a real bowl. Measured: four close-ups at the end
+      // of a scan put two bowls on the map that were never there. Requiring a
+      // frame to have established the green for itself before it can introduce
+      // anything costs nothing real, since a genuinely new bowl will be there
+      // in the next wide shot too.
     }
 
     // Anything the pose says was squarely in shot but that matched nothing
@@ -616,6 +636,7 @@
       newLandmarks,
       removedLandmarks,
       relocalised: estimate.relocalised,
+      carriedPlane: local.carriedPlane,
       matched: estimate.pairs.length,
       reason: null,
     };

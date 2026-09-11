@@ -550,6 +550,63 @@ function run() {
       LawnBowlsSlam.uncertainPairs(precise).length === 0);
   }
 
+  // --- 20: the green is carried into frames too sparse to work it out -----
+  // Working the green out from scratch needs four bowls in one shot. A real
+  // head often shows fewer, and refusing those frames is what made the map
+  // slow to fill in — so once its orientation is known it is reused.
+  {
+    const world = sim.spreadHead();
+    const slam = LawnBowlsSlam.createSlam();
+
+    // Two good frames establish the green.
+    LawnBowlsSlam.addFrame(slam, sim.shoot(world, sim.camera({ x: 0, y: -1.4, pitch: 55 })));
+    LawnBowlsSlam.addFrame(slam, sim.shoot(world, sim.camera({ x: 0.15, y: -1.38, yaw: 3, pitch: 55 })));
+    check('the green is remembered once it has been worked out', !!slam.groundNormal);
+
+    // Now frames showing only two bowls and the jack — too few to fit a plane.
+    let sparseMerged = 0;
+    let usedCarried = 0;
+    for (let i = 0; i < 4; i++) {
+      const sparse = sim.shoot(world, sim.camera({ x: 0.05 * i, y: -1.4, yaw: i, pitch: 55 }),
+        { skip: ['b2', 'b3', 'b4', 'b5', 'b6', 'b7'] });
+      const bowlsInShot = sparse.detections.filter(d => d !== sparse.jack).length;
+      if (bowlsInShot >= 4) continue; // not actually sparse, proves nothing
+      const result = LawnBowlsSlam.addFrame(slam, sparse);
+      if (result.merged) {
+        sparseMerged++;
+        if (result.carriedPlane) usedCarried++;
+      }
+    }
+    check('frames with too few bowls to fit a plane are still used', sparseMerged > 0,
+      'every sparse frame was refused, so the green is not being carried');
+    check('those frames are reported as reusing the remembered green', usedCarried > 0);
+  }
+
+  // --- 21: a remembered green is not reused once the view has turned ------
+  // Carrying it forward assumes the phone has not turned much. When it has,
+  // reusing the old orientation would place bowls against the wrong green, so
+  // the frame has to be refused instead.
+  {
+    const LawnBowlsGround = require('../ground.js');
+    const world = sim.spreadHead();
+    const facing = sim.shoot(world, sim.camera({ x: 0, y: -1.4, pitch: 55 }));
+    const fit = LawnBowlsGround.rectify(facing.detections, facing.jack,
+      { width: facing.width, height: facing.height, focalLength: facing.focalLength });
+    check('the reference frame rectifies', fit.ok && !!fit.normal, fit.reason);
+
+    // Two bowls only, seen from an angle the remembered green cannot explain.
+    const turned = sim.shoot(world, sim.camera({ x: 0.2, y: -1.2, pitch: 22 }),
+      { skip: ['b2', 'b3', 'b4', 'b5', 'b6', 'b7'] });
+    const wrongNormal = { x: fit.normal.x, y: -fit.normal.z, z: fit.normal.y }; // a large turn
+    const reused = LawnBowlsGround.rectify(turned.detections, turned.jack, {
+      width: turned.width, height: turned.height, focalLength: turned.focalLength,
+      priorNormal: wrongNormal,
+    });
+    check('a remembered green that no longer fits is refused',
+      reused.ok === false, 'it was reused anyway, against bowls that do not lie on it');
+    check('the refusal explains itself', !reused.ok && typeof reused.reason === 'string');
+  }
+
   return { name: 'slam', total, failures };
 }
 
