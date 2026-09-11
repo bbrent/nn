@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>real scan</title></head>
+<body style="margin:0;background:#111">
+<canvas id="frame"></canvas>
+<script src="/node_modules/onnxruntime-web/dist/ort.min.js"></script>
+<script src="/yolo-detector.js"></script>
+<script src="/ground.js"></script>
+<script src="/slam.js"></script>
+<script>
+// Runs real photographs of one end through the same chain the live app runs:
+// detect, rectify onto the green, merge into a shared map. The photos stand in
+// for the frames a phone would capture while scanning, so this exercises
+// everything the simulated harness does except with real turf, real lighting,
+// real shadows and a real lens.
+
+ort.env.wasm.wasmPaths = '/node_modules/onnxruntime-web/dist/';
+ort.env.wasm.numThreads = 1;
+
+let session = null;
+
+function loadImage(url) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error('could not load ' + url));
+    img.src = url;
+  });
+}
+
+window.runRealScan = async function (job) {
+  if (!session) {
+    session = await ort.InferenceSession.create('/models/yolov8n.onnx', { executionProviders: ['wasm'] });
+  }
+
+  const width = job.width;
+  const height = job.height;
+  const frame = document.getElementById('frame');
+  frame.width = width;
+  frame.height = height;
+  const fctx = frame.getContext('2d', { willReadFrequently: true });
+
+  const letterbox = document.createElement('canvas');
+  letterbox.width = letterbox.height = LawnBowlsYolo.INPUT_SIZE;
+  const lctx = letterbox.getContext('2d', { willReadFrequently: true });
+
+  const slam = LawnBowlsSlam.createSlam();
+  const views = [];
+
+  for (const view of job.views) {
+    const img = await loadImage(view.url);
+
+    // Photos come in at full camera resolution; the app works from a video
+    // frame. Downscaling to the same size keeps the detector facing the same
+    // amount of detail it would on a phone, so the results transfer.
+    fctx.drawImage(img, 0, 0, width, height);
+
+    const box = LawnBowlsYolo.computeLetterbox(width, height, LawnBowlsYolo.INPUT_SIZE);
+    lctx.fillStyle = 'rgb(114,114,114)';
+    lctx.fillRect(0, 0, LawnBowlsYolo.INPUT_SIZE, LawnBowlsYolo.INPUT_SIZE);
+    lctx.drawImage(frame, box.padX, box.padY, box.newWidth, box.newHeight);
+    const imageData = lctx.getImageData(0, 0, LawnBowlsYolo.INPUT_SIZE, LawnBowlsYolo.INPUT_SIZE);
+
+    const detected = await LawnBowlsYolo.detectAndRank(ort, session, imageData, box);
+
+    // The lens is read from the photo's own EXIF where it exists, so for real
+    // images there is nothing to guess. Where it doesn't, the same default the
+    // live app falls back to is used, which is what makes the two comparable.
+    const rectified = LawnBowlsGround.rectify(detected.detections, detected.usable ? detected.jack : null, {
+      width, height, focalLength: view.focalLengthPx || undefined,
+    });
+
+    const merged = LawnBowlsSlam.addFrame(slam, {
+      detections: detected.detections,
+      jack: detected.usable ? detected.jack : null,
+      width, height,
+      focalLength: view.focalLengthPx || undefined,
+    });
+
+    views.push({
+      name: view.name,
+      detections: detected.detections.length,
+      radii: detected.detections.map(d => Math.round(d.r * 10) / 10),
+      jackFound: !!detected.jack,
+      classifierUsable: detected.usable,
+      classifierReason: detected.reason,
+      rectified: rectified.ok,
+      rectifyReason: rectified.reason,
+      tilt: rectified.ok ? Math.round(rectified.tilt * 10) / 10 : null,
+      planeResidual: rectified.ok ? Math.round(rectified.residual * 1000) / 1000 : null,
+      keptAfterOutliers: rectified.ok ? rectified.points.length : 0,
+      jackRejected: rectified.ok ? !!rectified.jackRejected : false,
+      merged: merged.merged,
+      mergeReason: merged.reason,
+      relocalised: !!merged.relocalised,
+      matched: merged.matched || 0,
+      newLandmarks: merged.newLandmarks || 0,
+      focalLengthPx: view.focalLengthPx || null,
+    });
+  }
+
+  const confirmed = LawnBowlsSlam.getSnapshot(slam, { confirmedOnly: true });
+  const all = LawnBowlsSlam.getSnapshot(slam);
+
+  return {
+    views,
+    landmarks: slam.landmarks.map(l => ({
+      observations: l.observations,
+      jackVotes: l.jackVotes,
+      sigma: LawnBowlsSlam.positionError(l),
+    })),
+    tracked: all.bowls.length,
+    confirmed: {
+      usable: confirmed.usable,
+      reason: confirmed.reason,
+      bowls: confirmed.bowls.length,
+      ranking: confirmed.ranking.map(r => ({
+        dist: r.dist,
+        sigma: r.sigma,
+        observations: r.bowl.observations,
+      })),
+      uncertainPairs: confirmed.usable
+        ? LawnBowlsSlam.uncertainPairs(confirmed).map(p => ({
+            near: p.nearIndex, far: p.farIndex, gap: p.gap, noise: p.noise,
+          }))
+        : [],
+    },
+  };
+};
+
+window.__realReady = true;
+</script>
+</body>
+</html>

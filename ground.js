@@ -44,13 +44,33 @@
     root.LawnBowlsGround = factory();
   }
 })(typeof self !== 'undefined' ? self : this, function () {
-  // Jack diameter as a fraction of a bowl's. A match jack is about 64mm
-  // across; bowls run 116-134mm depending on size, so ~125mm is typical.
-  const JACK_SIZE_RATIO = 0.52;
-  // Focal length as a fraction of the frame's long edge, when nothing better
-  // is known. A phone main camera is around 65-75 degrees horizontally, which
-  // puts f/width near 0.7-0.8.
-  const DEFAULT_FOCAL_RATIO = 0.75;
+  // How large the labelled jack may be, relative to a typical bowl in the same
+  // frame, before the label is disbelieved. A real jack is about half a bowl
+  // across, so this only has to separate "clearly smaller" from "the same
+  // size" — no exact ratio is assumed anywhere, which matters because the
+  // measured ratio is not reliable: the detector's box runs large by roughly a
+  // fixed number of pixels, so small objects come out proportionally bigger. A
+  // real jack measured 0.58 of a bowl's apparent radius against a true 0.52.
+  const MAX_JACK_RADIUS_RATIO = 0.8;
+  // Focal length as a fraction of the frame's long edge. This is always a
+  // guess in the live app: a camera stream carries no lens information —
+  // getSettings() and getCapabilities() report resolution, frame rate and
+  // facing, never focal length — and it cannot be recovered from the picture
+  // either, since scaling it only stretches the depth axis and a stretched
+  // plane is still a plane.
+  //
+  // So the value is chosen to sit in the middle of what phones actually use.
+  // Main cameras run about 24-28mm equivalent, which on a 36mm-wide reference
+  // frame is f/width of 0.67 to 0.78; 24mm (0.667) is the most common by some
+  // margin, being what Pixel and most Android flagships ship, with iPhone at
+  // 26mm (0.72). Every real photo in test/fixtures/real is 24mm, read from its
+  // EXIF — which is what test-time calibration is for, since the app itself
+  // never gets to see it.
+  //
+  // Centring here keeps the worst realistic error to roughly 10% rather than
+  // the 12.5% that 0.75 cost on the most common phone of all, and a focal
+  // length wrong by that much still leaves the ranking intact.
+  const DEFAULT_FOCAL_RATIO = 0.70;
   // A plane needs three points, and three exactly-determined ones fit any
   // arrangement perfectly with no way to tell a good fit from a bad one.
   const MIN_POINTS_FOR_PLANE = 4;
@@ -77,25 +97,39 @@
   // radius. From u = f*X/Z and r = f*R/Z: X/R = u/r, Y/R = v/r, Z/R = f/r.
   // Image coordinates are taken relative to the principal point (frame
   // centre), which is where the optical axis meets the sensor.
-  function recover3D(detections, jack, focal, width, height) {
+  function recover3D(detections, focal, width, height) {
     const cx = width / 2;
     const cy = height / 2;
     const points = [];
     for (const d of detections) {
       if (!(d.r > 0)) continue;
-      // Scale the jack's radius up to what a bowl at the same depth would
-      // measure, so one consistent unit covers every detection.
-      const equivalentRadius = d === jack ? d.r / JACK_SIZE_RATIO : d.r;
-      const u = d.x - cx;
-      const v = d.y - cy;
       points.push({
-        x: u / equivalentRadius,
-        y: v / equivalentRadius,
-        z: focal / equivalentRadius,
+        x: (d.x - cx) / d.r,
+        y: (d.y - cy) / d.r,
+        z: focal / d.r,
         detection: d,
       });
     }
     return points;
+  }
+
+  // Where the ray through a pixel meets the green, in the plane's own
+  // coordinates. Once the bowls have fixed the plane, this places anything —
+  // jack included — from its position in the frame alone, with no reference to
+  // how big it is or is supposed to be. Apparent size is only ever needed to
+  // establish the plane in the first place, and the bowls do that.
+  function rayToPlane(detection, plane, basis, focal, width, height) {
+    const d = { x: detection.x - width / 2, y: detection.y - height / 2, z: focal };
+    const n = plane.normal;
+    const nDotD = n.x * d.x + n.y * d.y + n.z * d.z;
+    if (Math.abs(nDotD) < 1e-9) return null;
+    const t = (n.x * plane.centroid.x + n.y * plane.centroid.y + n.z * plane.centroid.z) / nDotD;
+    if (t <= 0) return null;
+    const hit = { x: t * d.x - plane.centroid.x, y: t * d.y - plane.centroid.y, z: t * d.z - plane.centroid.z };
+    return {
+      x: (hit.x * basis.e1.x + hit.y * basis.e1.y + hit.z * basis.e1.z) / 2,
+      y: (hit.x * basis.e2.x + hit.y * basis.e2.y + hit.z * basis.e2.z) / 2,
+    };
   }
 
   // Least-squares plane through the recovered points, as a unit normal and a
@@ -368,26 +402,69 @@
       return { ok: false, reason: 'too few detections to work out the ground plane', points: [], focalLength: focal };
     }
 
-    const fit = fitPlaneRobustly(recover3D(usable, jack, focal, width, height));
+    // The green is defined by the bowls alone. They are all the same real size,
+    // so comparing their depths assumes nothing; the jack is a different size
+    // and is therefore left out of the fit rather than converted into the
+    // bowls' units on an assumed ratio. Measured on real photographs, that
+    // ratio is not even stable: a jack came out at 0.58 of a bowl's apparent
+    // radius against a true 0.52, because the detector's box runs a little
+    // large by a roughly fixed number of pixels and the jack is small enough
+    // for that to matter. Feeding it in on the wrong ratio pushed it clear of
+    // the green and got the scoring reference thrown out of its own frame.
+    const bowlDetections = usable.filter(d => d !== jack);
+    if (bowlDetections.length < MIN_POINTS_FOR_PLANE) {
+      return { ok: false, reason: 'too few bowls to work out the ground plane', points: [], focalLength: focal };
+    }
+
+    const fit = fitPlaneRobustly(recover3D(bowlDetections, focal, width, height));
     if (!fit) {
       return { ok: false, reason: 'detections are collinear — cannot fit the ground', points: [], focalLength: focal };
     }
     const plane = fit.plane;
     const spatial = fit.inliers;
-    const jackRejected = !!jack && !spatial.some(p => p.detection === jack);
+
+    // A jack is visibly smaller than a bowl. If whatever was labelled as one
+    // is not, the label is wrong — the cheapest possible check, and it needs
+    // no assumption about exactly how much smaller.
+    const bowlRadii = bowlDetections.map(d => d.r).sort((a, b) => a - b);
+    const medianBowlRadius = bowlRadii[Math.floor(bowlRadii.length / 2)];
+    const jackRejected = !!jack && jack.r > medianBowlRadius * MAX_JACK_RADIUS_RATIO;
 
     const { e1, e2 } = planeBasis(plane.normal);
-    const points = spatial.map(p => {
+    const basis = { e1, e2 };
+
+    // Bowls are placed by dropping their recovered position onto the green the
+    // short way. Their real size is known, so the depth read from their
+    // apparent size is worth using, and the part of it that is noise mostly
+    // pushes them off the plane rather than along it — where this projection
+    // discards it.
+    //
+    // The jack gets no such treatment. Its apparent size is the one
+    // measurement here that cannot be trusted (see MAX_JACK_RADIUS_RATIO), so
+    // its depth is not used at all: it is placed purely by where its ray meets
+    // the green, which needs only its position in the frame. Using rays for
+    // everything was tried and is worse — with no depth to lean on, every
+    // error in the plane turns into a sideways error on the ground, which at
+    // an oblique angle more than tripled the distance error across a simulated
+    // scan. Each object is placed by whatever it is that we actually know
+    // about it.
+    const points = [];
+    for (const p of spatial) {
       const dx = p.x - plane.centroid.x;
       const dy = p.y - plane.centroid.y;
       const dz = p.z - plane.centroid.z;
-      return {
+      points.push({
         // /2 converts bowl-radius units to bowl-diameters.
         x: (dx * e1.x + dy * e1.y + dz * e1.z) / 2,
         y: (dx * e2.x + dy * e2.y + dz * e2.z) / 2,
         detection: p.detection,
-      };
-    });
+      });
+    }
+
+    if (jack && !jackRejected) {
+      const onGround = rayToPlane(jack, plane, basis, focal, width, height);
+      if (onGround) points.push({ x: onGround.x, y: onGround.y, detection: jack });
+    }
 
     // The visible footprint is inset by roughly a bowl's width so detections
     // clipped by the frame edge don't count as "clearly looked at and absent".
@@ -412,7 +489,7 @@
   }
 
   return {
-    JACK_SIZE_RATIO,
+    MAX_JACK_RADIUS_RATIO,
     DEFAULT_FOCAL_RATIO,
     MIN_POINTS_FOR_PLANE,
     STEEP_TILT_DEGREES,
@@ -421,6 +498,7 @@
     defaultFocalLength,
     recover3D,
     fitPlane,
+    rayToPlane,
     planeBasis,
     planeResidual,
     fitPlaneRobustly,

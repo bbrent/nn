@@ -30,7 +30,23 @@
   // nearest round-object class instead).
   const DEFAULT_ALLOWED_CLASSES = new Set([32, 45]);
 
-  const DEFAULT_CONF_THRESHOLD = 0.1;
+  // Deliberately very low, because on real photographs confidence tracks how
+  // dark the bowl is rather than how sure the model is that something round is
+  // there. Measured on test/fixtures/real: in one clear, well-lit, nearly
+  // overhead shot the blue bowl scored 0.73 and the yellow jack 0.64, while
+  // the three black bowls scored 0.17, 0.05 and 0.04 — and every one of those
+  // five detections landed within a few pixels of a real object, with nothing
+  // spurious at all. A threshold of 0.1 therefore did not filter noise, it
+  // filtered out the black bowls specifically, which is most of a real set.
+  // Across the five real photos, dropping to this value found half again as
+  // many objects (12 detections to 18) and invented none.
+  //
+  // Letting weak detections through is safe here in a way it would not be in a
+  // bare detector, because everything downstream is built to disbelieve them:
+  // a frame's detections must agree on one flat green, a landmark must be seen
+  // several times before it can be scored, and anything seen once or twice and
+  // then looked straight at is dropped.
+  const DEFAULT_CONF_THRESHOLD = 0.03;
   const DEFAULT_IOU_THRESHOLD = 0.45;
 
   // Jack is ~0.54x a bowl's diameter; same physical reasoning as detection.js.

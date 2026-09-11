@@ -7,7 +7,8 @@
     "test": "node test/run.js",
     "generate-fixtures": "node test/generate-fixtures.js",
     "generate-fixtures:three": "node test/generate-three-fixtures.js",
-    "scan": "node test/scan-harness.js"
+    "scan": "node test/scan-harness.js",
+    "real-scan": "node test/real-scan.js"
   },
   "repository": {
     "type": "git",
