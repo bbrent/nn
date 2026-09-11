@@ -6,7 +6,8 @@
   "scripts": {
     "test": "node test/run.js",
     "generate-fixtures": "node test/generate-fixtures.js",
-    "generate-fixtures:three": "node test/generate-three-fixtures.js"
+    "generate-fixtures:three": "node test/generate-three-fixtures.js",
+    "scan": "node test/scan-harness.js"
   },
   "repository": {
     "type": "git",
@@ -22,6 +23,7 @@
   "devDependencies": {
     "@techstark/opencv-js": "^5.0.0-release.1",
     "canvas": "^3.2.3",
+    "onnxruntime-web": "^1.29.0",
     "playwright": "^1.62.1",
     "three": "^0.185.1"
   }

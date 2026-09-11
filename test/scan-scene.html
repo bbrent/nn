@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>scan harness</title></head>
+<body style="margin:0;background:#000">
+<canvas id="c"></canvas>
+<script src="/node_modules/onnxruntime-web/dist/ort.min.js"></script>
+<script src="/yolo-detector.js"></script>
+<script src="/ground.js"></script>
+<script src="/slam.js"></script>
+<script type="module">
+import * as THREE from '/node_modules/three/build/three.module.js';
+
+// Drives a whole simulated scan: a real 3D green rendered by WebGL, a camera
+// moved along a path over it, and every frame pushed through the same
+// detection -> rectification -> mapping chain the app runs. Unlike the
+// geometric simulator used by the unit tests, nothing here is handed perfect
+// detections: the frames are pixels, and the detector has to find the bowls
+// in them the same way it would on a phone.
+
+ort.env.wasm.wasmPaths = '/node_modules/onnxruntime-web/dist/';
+ort.env.wasm.numThreads = 1;
+
+function mulberry32(seed) {
+  return function () {
+    seed |= 0;
+    seed = (seed + 0x6d2b79f5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// Mottled green, so the detector faces texture rather than a flat colour.
+function makeTurfTexture(seed, size) {
+  const canvas = document.createElement('canvas');
+  canvas.width = canvas.height = size;
+  const ctx = canvas.getContext('2d');
+  const rand = mulberry32(seed);
+  const image = ctx.createImageData(size, size);
+  for (let i = 0; i < image.data.length; i += 4) {
+    const shade = 60 + rand() * 45;
+    image.data[i] = shade * 0.45;
+    image.data[i + 1] = shade;
+    image.data[i + 2] = shade * 0.4;
+    image.data[i + 3] = 255;
+  }
+  ctx.putImageData(image, 0, 0);
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
+  texture.repeat.set(8, 8);
+  return texture;
+}
+
+let state = null;
+
+window.buildScene = function (config) {
+  const canvas = document.getElementById('c');
+  canvas.width = config.width;
+  canvas.height = config.height;
+
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+  renderer.setPixelRatio(1);
+  renderer.setSize(config.width, config.height, false);
+  renderer.shadowMap.enabled = true;
+
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x5a7a4a);
+
+  const ground = new THREE.Mesh(
+    new THREE.PlaneGeometry(config.groundSize, config.groundSize),
+    new THREE.MeshStandardMaterial({ map: makeTurfTexture(config.seed, 256), roughness: 1 })
+  );
+  ground.rotation.x = -Math.PI / 2;
+  ground.receiveShadow = true;
+  scene.add(ground);
+
+  scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+  const sun = new THREE.DirectionalLight(0xffffff, 1.1);
+  sun.position.set(2.2, 4, 1.4);
+  sun.castShadow = true;
+  scene.add(sun);
+
+  // Bowls sit ON the green, so their centres are one radius above it.
+  const spheres = [];
+  for (const item of config.objects) {
+    const mesh = new THREE.Mesh(
+      new THREE.SphereGeometry(item.radius, 48, 32),
+      new THREE.MeshStandardMaterial({ color: item.color, roughness: 0.35, metalness: 0.05 })
+    );
+    mesh.position.set(item.x, item.radius, item.z);
+    mesh.castShadow = true;
+    scene.add(mesh);
+    spheres.push({ mesh, item });
+  }
+
+  const camera = new THREE.PerspectiveCamera(config.fov, config.width / config.height, 0.05, 60);
+
+  const letterbox = document.createElement('canvas');
+  letterbox.width = letterbox.height = LawnBowlsYolo.INPUT_SIZE;
+
+  state = { renderer, scene, camera, spheres, config, letterbox };
+  return { objects: config.objects.length };
+};
+
+// Moves the camera and renders one frame, returning the pixels plus the true
+// screen position and radius of every object — three.js's own projection, so
+// the ground truth cannot drift from what was actually drawn.
+function renderAt(pose) {
+  const { renderer, scene, camera, spheres, config } = state;
+  camera.position.set(pose.x, pose.y, pose.z);
+  camera.lookAt(pose.tx, pose.ty, pose.tz);
+  camera.updateMatrixWorld();
+  renderer.render(scene, camera);
+
+  const right = new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 0);
+  const halfW = config.width / 2;
+  const halfH = config.height / 2;
+
+  const truth = [];
+  for (const { mesh, item } of spheres) {
+    const centre = mesh.position.clone();
+    const projected = centre.clone().project(camera);
+    const edge = centre.clone().add(right.clone().multiplyScalar(item.radius)).project(camera);
+    const sx = (projected.x + 1) * halfW;
+    const sy = (1 - projected.y) * halfH;
+    const ex = (edge.x + 1) * halfW;
+    const ey = (1 - edge.y) * halfH;
+    truth.push({
+      name: item.name,
+      isJack: !!item.isJack,
+      x: sx,
+      y: sy,
+      r: Math.hypot(ex - sx, ey - sy),
+      worldX: item.x,
+      worldZ: item.z,
+      inFrame: sx >= 0 && sy >= 0 && sx <= config.width && sy <= config.height && projected.z < 1,
+    });
+  }
+  return truth;
+}
+
+// Matches what the detector found against what was really there, so each
+// frame can report the detector's own hit rate separately from whatever the
+// map does with it afterwards.
+function scoreDetections(detections, truth) {
+  const visible = truth.filter(t => t.inFrame);
+  const claimed = new Set();
+  let hits = 0;
+  // Per-detection error against what was really drawn. Radius matters as much
+  // as position here: radius is what the depth is read from, so a radius that
+  // is consistently a few percent off becomes a distance that is consistently
+  // wrong — and being consistent, it is invisible to the spread between
+  // frames that the reported uncertainty is built from.
+  const radiusRatios = [];
+  const centreErrors = [];
+  for (const t of visible) {
+    let best = -1;
+    let bestDist = Infinity;
+    detections.forEach((d, i) => {
+      if (claimed.has(i)) return;
+      const dist = Math.hypot(d.x - t.x, d.y - t.y);
+      if (dist < Math.max(t.r * 1.5, 12) && dist < bestDist) { bestDist = dist; best = i; }
+    });
+    if (best >= 0) {
+      claimed.add(best);
+      hits++;
+      radiusRatios.push(detections[best].r / t.r);
+      centreErrors.push(bestDist / t.r);
+    }
+  }
+  return {
+    visible: visible.length, found: hits, spurious: detections.length - claimed.size,
+    radiusRatios, centreErrors,
+  };
+}
+
+window.runScan = async function (path) {
+  const { config, letterbox } = state;
+  const lctx = letterbox.getContext('2d', { willReadFrequently: true });
+  const session = await ort.InferenceSession.create('/models/yolov8n.onnx', { executionProviders: ['wasm'] });
+
+  const slam = LawnBowlsSlam.createSlam();
+  const frames = [];
+
+  for (const pose of path) {
+    const truth = renderAt(pose);
+
+    // Same letterboxing the app does before inference.
+    const box = LawnBowlsYolo.computeLetterbox(config.width, config.height, LawnBowlsYolo.INPUT_SIZE);
+    lctx.fillStyle = 'rgb(114,114,114)';
+    lctx.fillRect(0, 0, LawnBowlsYolo.INPUT_SIZE, LawnBowlsYolo.INPUT_SIZE);
+    lctx.drawImage(state.renderer.domElement, box.padX, box.padY, box.newWidth, box.newHeight);
+    const imageData = lctx.getImageData(0, 0, LawnBowlsYolo.INPUT_SIZE, LawnBowlsYolo.INPUT_SIZE);
+
+    const result = await LawnBowlsYolo.detectAndRank(ort, session, imageData, box);
+    const detectionQuality = scoreDetections(result.detections, truth);
+
+    const merged = LawnBowlsSlam.addFrame(slam, {
+      detections: result.detections,
+      jack: result.usable ? result.jack : null,
+      width: config.width,
+      height: config.height,
+    });
+
+    frames.push({
+      detections: result.detections.length,
+      jackFound: !!result.jack,
+      classifierUsable: result.usable,
+      classifierReason: result.reason,
+      merged: merged.merged,
+      mergeReason: merged.reason,
+      relocalised: !!merged.relocalised,
+      ...detectionQuality,
+    });
+  }
+
+  const snapshot = LawnBowlsSlam.getSnapshot(slam, { confirmedOnly: true });
+  const loose = LawnBowlsSlam.getSnapshot(slam);
+
+  return {
+    frames,
+    landmarks: slam.landmarks.map(l => ({
+      x: l.x, y: l.y, observations: l.observations, jackVotes: l.jackVotes,
+      sigma: LawnBowlsSlam.positionError(l),
+    })),
+    confirmed: {
+      usable: snapshot.usable,
+      reason: snapshot.reason,
+      jack: snapshot.jack ? { x: snapshot.jack.x, y: snapshot.jack.y } : null,
+      ranking: snapshot.ranking.map(r => ({ dist: r.dist, sigma: r.sigma, x: r.bowl.x, y: r.bowl.y })),
+    },
+    trackedCount: loose.bowls.length,
+  };
+};
+
+window.__scanReady = true;
+</script>
+</body>
+</html>

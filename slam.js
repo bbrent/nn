@@ -85,13 +85,29 @@
   const MIN_INLIERS_TRACKING = 2;
   const MIN_INLIERS_RELOCALISING = 3;
   // Floor on how precisely a position is ever claimed to be known, in
-  // bowl-diameters (~5mm on a 125mm bowl). Repeated looks that happen to agree
-  // shrink the measured spread toward zero, but the errors that do not average
-  // out — a guessed focal length, a detector that centres slightly off — are
-  // still there. Claiming sub-millimetre certainty from a phone camera would
-  // be a lie, and the whole point of this number is to be honest about when to
-  // reach for the measure instead.
-  const MIN_POSITION_ERROR = 0.04;
+  // bowl-diameters. Repeated looks that agree shrink the measured spread
+  // toward zero, but that spread only ever captures the part of the error
+  // that varies between frames. The dominant part does not vary.
+  //
+  // Measured end to end (test/scan-harness.js renders a green, runs the real
+  // detector over it and compares the resulting map against what was drawn):
+  // the detector reports bowl radii about 3.5% larger than they truly are,
+  // consistently, and depth is read from radius — so that becomes the same
+  // depth error in every frame, invisible to any amount of averaging. Worse,
+  // box precision is roughly constant in pixels, so the relative radius error
+  // grows for smaller, further bowls; the recovered green is then slightly
+  // tilted and distances come out wrong by differing amounts rather than by a
+  // uniform factor. Across a full simulated scan that left distance errors
+  // averaging 0.34 bowl-diameters and reaching 0.78, against a spread-derived
+  // sigma of about 0.10 — confidently wrong by roughly threefold, and wrong in
+  // the direction that matters, since it would declare bowls separable that
+  // this pipeline cannot actually separate.
+  //
+  // This floor is set so two sigma covers the worst error seen there. It makes
+  // the app decline more close calls, which is the honest outcome: those are
+  // exactly the ends a player would put the measure on anyway. Calibrated on
+  // simulation and due a revisit against real footage.
+  const MIN_POSITION_ERROR = 0.28;
   // A landmark seen once has no measurable spread at all. That is not
   // precision, it is ignorance, so it is treated as very uncertain until a
   // second look either confirms or contradicts it.
