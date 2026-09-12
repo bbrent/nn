@@ -54,6 +54,9 @@ let recentObservations = []; // newest first: { id, thumbnail (data URL), embedd
 let pickerSelection = new Set(); // observation ids currently selected in the open picker
 let resumeScanAfterPicker = false; // the picker interrupted a live scan; restart it on close
 let contested = null; // [i, j] into frozen.ranking when those two can't be told apart
+let lastKnownPose = null; // last pose that could be worked out, for drawing through a gap
+let lastBowlDiameterPx = 0; // the frame scale that went with it
+let framesSincePlaced = 0; // how stale that pose has become
 
 let video, overlay, overlayCtx, statusEl, rankingEl, scanBtn, registerBtn, registryEl;
 let pickerModal, pickerGrid, pickerConfirmBtn, pickerCancelBtn;
@@ -263,6 +266,9 @@ function toggleScan() {
     frozen = null;
     assignments = [];
     slam = LawnBowlsSlam.createSlam();
+    lastKnownPose = null;
+    lastBowlDiameterPx = 0;
+    framesSincePlaced = 0;
     rankingEl.innerHTML = '';
     scanBtn.hidden = false;
     scanBtn.textContent = 'Stop Scan';
@@ -321,14 +327,32 @@ async function processFrame() {
       height: video.videoHeight,
     });
 
-    // Bowls the map knows about, projected back into this frame's view — so a
-    // bowl the detector missed this moment still shows where it is, instead of
-    // blinking out and looking like tracking has failed.
-    const ghosts = slamResult.merged
-      ? LawnBowlsSlam.projectToFrame(slam, slamResult.pose, slamResult.bowlDiameterPx)
+    // Bowls the map knows about, projected back into this frame's view.
+    //
+    // These are drawn from the last pose that could be worked out, not only
+    // from this frame's. Previously a frame that failed to place itself drew
+    // nothing at all, which blanked every bowl on screen — and a frame is most
+    // likely to fail exactly when the phone is being moved, so the bowls
+    // vanished at the worst possible moment and it looked as though everything
+    // had been forgotten. Nothing had: the map still holds every position. It
+    // was only the drawing that stopped.
+    //
+    // While the pose is stale the positions drift, since the camera has moved
+    // and these have not, so they fade the longer it has been since the last
+    // fix rather than pretending to be current.
+    if (slamResult.merged) {
+      lastKnownPose = slamResult.pose;
+      lastBowlDiameterPx = slamResult.bowlDiameterPx;
+      framesSincePlaced = 0;
+    } else {
+      framesSincePlaced++;
+    }
+
+    const ghosts = lastKnownPose
+      ? LawnBowlsSlam.projectToFrame(slam, lastKnownPose, lastBowlDiameterPx)
       : [];
 
-    drawOverlay(result.detections, result.jack, result.usable ? result.ranking : [], ghosts);
+    drawOverlay(result.detections, result.jack, result.usable ? result.ranking : [], ghosts, framesSincePlaced);
 
     const mapSnapshot = LawnBowlsSlam.getSnapshot(slam);
     renderTrackingList(mapSnapshot, result.detections.length);
@@ -498,23 +522,40 @@ const JACK_COLOR = '#ffd54f';
 const UNRANKED_COLOR = '#42a5f5';
 // Deliberately neutral, so a remembered bowl never reads as a fresh detection.
 const GHOST_COLOR = '#b0bec5';
+// Frames without a fix before a remembered bowl reaches its faintest. It keeps
+// being drawn after that — the map still knows where it is — just quietly.
+const STALE_FADE_FRAMES = 12;
+// Frames without a fix that count as just part of moving the phone about,
+// rather than anything the person needs telling about.
+const BRIEF_GAP_FRAMES = 4;
 // Ring around the two bowls the score turns on when they can't be separated.
 const CONTESTED_COLOR = '#ffa726';
 
-function drawOverlay(detections, jack, ranking, ghosts) {
+function drawOverlay(detections, jack, ranking, ghosts, staleness) {
   overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
 
   // Ghosts go down first, underneath the live detections: bowls the map knows
   // are here but that this frame's detector didn't find. Without these the
   // overlay blinks empty whenever detection has a weak frame, which reads as
   // "it has lost everything" when in fact nothing has been lost at all.
+  //
+  // A stale pose means these have drifted — the camera has moved since they
+  // were last placed — so they fade with age. They never fade out completely
+  // while the map holds them, because a bowl shown a little out of place still
+  // says "this is remembered, keep going", where an empty screen says the
+  // opposite and is simply untrue.
+  const freshness = Math.max(0.3, 1 - (staleness || 0) / STALE_FADE_FRAMES);
+
   for (const ghost of ghosts || []) {
     if (ghost.x < -ghost.r || ghost.y < -ghost.r || ghost.x > overlay.width + ghost.r || ghost.y > overlay.height + ghost.r) {
       continue; // off-screen this frame
     }
     const covered = detections.some(d => Math.hypot(d.x - ghost.x, d.y - ghost.y) < Math.max(d.r, ghost.r));
     if (covered) continue; // a live detection is already drawn over it
-    drawAura(ghost, GHOST_COLOR, false, ghost.confirmed ? 0.4 : 0.18, true);
+
+    const color = ghost.isJack ? JACK_COLOR : GHOST_COLOR;
+    drawAura(ghost, color, ghost.isJack, (ghost.confirmed ? 0.45 : 0.2) * freshness, true);
+    drawConfidenceRing(ghost, color, freshness);
   }
 
   // Draw current detections with full confidence
@@ -553,6 +594,26 @@ function drawAura(d, color, isJack, opacity, isDashed) {
   overlayCtx.stroke();
   overlayCtx.setLineDash([]);
   overlayCtx.globalAlpha = 1.0;
+}
+
+// A ring at the radius the position is actually known to. A bowl looked at
+// from several angles gets a tight ring; one glimpsed once gets a wide loose
+// one. It answers the question the overlay could not previously answer at all
+// — not just where the app thinks a bowl is, but how much that is worth.
+function drawConfidenceRing(point, color, alpha) {
+  if (!(point.sigmaPx > 0)) return;
+  // Below the bowl's own outline there is nothing useful to show: the position
+  // is known better than the bowl is wide.
+  const radius = point.r + point.sigmaPx;
+  if (radius <= point.r * 1.1) return;
+
+  overlayCtx.beginPath();
+  overlayCtx.arc(point.x, point.y, radius, 0, 2 * Math.PI);
+  overlayCtx.strokeStyle = hexToRgba(color, 0.35 * alpha);
+  overlayCtx.lineWidth = 1.5;
+  overlayCtx.setLineDash([3, 5]);
+  overlayCtx.stroke();
+  overlayCtx.setLineDash([]);
 }
 
 function hexToRgba(hex, alpha) {
@@ -605,7 +666,14 @@ function trackingStatus(slamResult, snapshot) {
   const mapped = snapshot.bowls.length;
 
   if (!slamResult.merged) {
-    return `Lost the map — pan back over bowls you've already scanned. (${slamResult.reason})`;
+    // "Lost" was the wrong word and the wrong feeling: nothing has been lost,
+    // the map still holds every bowl. All that happened is that this one frame
+    // could not be placed, which is normal while the phone is moving. Only say
+    // something is wrong once it has gone on long enough to actually be wrong.
+    if (framesSincePlaced <= BRIEF_GAP_FRAMES) {
+      return `Holding ${mapped} bowl(s) — keep moving steadily.`;
+    }
+    return `Still holding ${mapped} bowl(s), but can't place this view — pan back over bowls you've already scanned. (${slamResult.reason})`;
   }
   if (!snapshot.usable) {
     return `Tracking ${mapped} bowl(s) — now take one look at the jack to start scoring.`;

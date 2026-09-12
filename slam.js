@@ -797,6 +797,12 @@
         x: local.x * bowlDiameterPx,
         y: local.y * bowlDiameterPx,
         r: (bowlDiameterPx / 2) * pose.scale,
+        // How well this position is actually known, in the same pixels — so the
+        // overlay can show the map's own confidence rather than implying every
+        // bowl is pinned down equally well.
+        sigmaPx: positionError(landmark) * bowlDiameterPx,
+        observations: landmark.observations,
+        isJack: landmark.jackVotes > 0,
         landmark,
         confirmed: landmark.observations >= CONFIRM_OBSERVATIONS,
       };
