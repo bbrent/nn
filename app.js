@@ -51,7 +51,8 @@ let frozen = null; // { detections, jack, ranking } laid out from the map on Sto
 let assignments = []; // parallel to frozen.ranking: 'mine' | 'theirs' | null
 let registry = LawnBowlsRegistry.createRegistry(); // player roster + appearance galleries, persisted in localStorage
 let recentObservations = []; // newest first: { id, thumbnail (data URL), embedding } — feeds the registration picker
-let pickerSelection = new Set(); // observation ids currently selected in the open picker
+let pickerSeeds = new Set(); // observations the person pointed at as clear examples
+let pickerExcluded = new Set(); // proposed matches they have waved off
 let resumeScanAfterPicker = false; // the picker interrupted a live scan; restart it on close
 let contested = null; // [i, j] into frozen.ranking when those two can't be told apart
 let lastKnownPose = null; // last pose that could be worked out, for drawing through a gap
@@ -59,7 +60,7 @@ let lastBowlDiameterPx = 0; // the frame scale that went with it
 let framesSincePlaced = 0; // how stale that pose has become
 
 let video, overlay, overlayCtx, statusEl, rankingEl, scanBtn, registerBtn, registryEl;
-let pickerModal, pickerGrid, pickerConfirmBtn, pickerCancelBtn;
+let pickerModal, pickerGrid, pickerConfirmBtn, pickerCancelBtn, pickerHintEl;
 let letterboxCanvas, letterboxCtx; // offscreen 640x640: YOLO's fixed input size
 let frameCanvas, frameCtx; // offscreen, native video resolution: source for bowl crops
 let cropCanvas, cropCtx; // offscreen 224x224: embedding model's fixed input size
@@ -77,6 +78,7 @@ document.addEventListener('DOMContentLoaded', () => {
   pickerGrid = document.getElementById('pickerGrid');
   pickerConfirmBtn = document.getElementById('pickerConfirm');
   pickerCancelBtn = document.getElementById('pickerCancel');
+  pickerHintEl = document.getElementById('pickerHint');
 
   letterboxCanvas = document.createElement('canvas');
   letterboxCanvas.width = LawnBowlsYolo.INPUT_SIZE;
@@ -384,7 +386,8 @@ function openRegistrationPicker() {
     if (rafId) cancelAnimationFrame(rafId);
   }
 
-  pickerSelection.clear();
+  pickerSeeds.clear();
+  pickerExcluded.clear();
   picking = true;
   registerBtn.disabled = true;
   pickerModal.hidden = false;
@@ -426,21 +429,84 @@ async function pickerLoop() {
   }
 }
 
+// What the picker currently thinks belongs to this player: the pictures the
+// person pointed at as clear examples, plus everything that looks like them,
+// minus anything they have waved off.
+//
+// Asking somebody to tick every thumbnail was the wrong job to give them. The
+// pictures are not equally useful — most are half-shadowed, blurred by the
+// pan, or caught at an angle — and they can see at a glance which one or two
+// actually show the bowl properly. Those are worth their attention; finding
+// the rest that look the same is what the appearance embeddings are for.
+function currentProposal() {
+  const seeds = recentObservations.filter(obs => pickerSeeds.has(obs.id));
+  const scores = LawnBowlsRegistry.proposeGroup(
+    recentObservations.map(obs => obs.embedding),
+    seeds.map(obs => obs.embedding)
+  );
+
+  return recentObservations.map((obs, i) => {
+    const isSeed = pickerSeeds.has(obs.id);
+    const excluded = pickerExcluded.has(obs.id);
+    const matched = scores[i].proposed;
+    return {
+      obs,
+      isSeed,
+      excluded,
+      matched,
+      similarity: scores[i].similarity,
+      included: isSeed || (matched && !excluded),
+    };
+  });
+}
+
 function renderPickerGrid() {
+  const proposal = currentProposal();
+  const includedCount = proposal.filter(p => p.included).length;
+  const seedCount = proposal.filter(p => p.isSeed).length;
+
+  pickerHintEl.textContent = seedCount === 0
+    ? 'Tap the clearest picture of their bowl — the rest will be found for you.'
+    : `${includedCount} picture(s) look like this bowl. Tap any to drop it, or add another clear one.`;
+
   pickerGrid.innerHTML = '';
-  recentObservations.forEach(obs => {
+  for (const entry of proposal) {
     const cell = document.createElement('div');
-    cell.className = 'pickerThumb' + (pickerSelection.has(obs.id) ? ' selected' : '');
+    cell.className = 'pickerThumb' +
+      (entry.isSeed ? ' seed' : '') +
+      (entry.included && !entry.isSeed ? ' proposed' : '') +
+      (entry.matched && entry.excluded ? ' excluded' : '');
+
     const img = document.createElement('img');
-    img.src = obs.thumbnail;
+    img.src = entry.obs.thumbnail;
     cell.appendChild(img);
+
+    // Show the score on anything the app has an opinion about. A borderline
+    // match is exactly where the person's judgement beats the threshold's, and
+    // they can only exercise it if they can see the number.
+    if (entry.similarity !== null && !entry.isSeed) {
+      const badge = document.createElement('span');
+      badge.className = 'pickerScore';
+      badge.textContent = Math.round(entry.similarity * 100) + '%';
+      cell.appendChild(badge);
+    }
+
     cell.addEventListener('click', () => {
-      if (pickerSelection.has(obs.id)) pickerSelection.delete(obs.id);
-      else pickerSelection.add(obs.id);
+      if (entry.isSeed) {
+        pickerSeeds.delete(entry.obs.id);
+      } else if (entry.matched && !entry.excluded) {
+        pickerExcluded.add(entry.obs.id); // "no, not that one"
+      } else if (entry.excluded) {
+        pickerExcluded.delete(entry.obs.id); // changed their mind
+      } else {
+        pickerSeeds.add(entry.obs.id); // another clear example
+        pickerExcluded.delete(entry.obs.id);
+      }
       renderPickerGrid();
     });
+
     pickerGrid.appendChild(cell);
-  });
+  }
 }
 
 function closePicker() {
@@ -464,9 +530,9 @@ function cancelPicker() {
 }
 
 function confirmPicker() {
-  const selected = recentObservations.filter(obs => pickerSelection.has(obs.id));
+  const selected = currentProposal().filter(entry => entry.included).map(entry => entry.obs);
   if (selected.length === 0) {
-    alert('Select at least one bowl first.');
+    alert('Tap the clearest picture of their bowl first.');
     return;
   }
 

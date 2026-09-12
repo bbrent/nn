@@ -164,18 +164,67 @@ html, body {
   object-fit: cover;
 }
 
-.pickerThumb.selected {
+/* A picture the person pointed at as a clear example of the bowl. */
+.pickerThumb.seed {
+  border-color: #ffb300;
+}
+
+.pickerThumb.seed::after {
+  content: '★';
+  position: absolute;
+  top: 1px;
+  right: 4px;
+  color: #ffb300;
+  font-weight: bold;
+  text-shadow: 0 0 3px #000;
+}
+
+/* Found by matching against those examples, rather than chosen by hand. */
+.pickerThumb.proposed {
   border-color: #2e7d32;
 }
 
-.pickerThumb.selected::after {
+.pickerThumb.proposed::after {
   content: '✓';
   position: absolute;
   top: 2px;
   right: 4px;
-  color: #2e7d32;
+  color: #66bb6a;
   font-weight: bold;
   text-shadow: 0 0 3px #000;
+}
+
+/* Matched, but the person said no. Kept visible so it can be put back. */
+.pickerThumb.excluded {
+  border-color: #b71c1c;
+}
+
+.pickerThumb.excluded img {
+  opacity: 0.3;
+}
+
+.pickerThumb.excluded::after {
+  content: '✕';
+  position: absolute;
+  top: 2px;
+  right: 4px;
+  color: #ef5350;
+  font-weight: bold;
+  text-shadow: 0 0 3px #000;
+}
+
+/* How alike the app thinks this is — shown so a borderline call can be
+   overruled on sight rather than taken on trust. */
+.pickerScore {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  font-size: 10px;
+  text-align: center;
+  background: rgba(0, 0, 0, 0.6);
+  color: #ddd;
+  padding: 1px 0;
 }
 
 #pickerControls {

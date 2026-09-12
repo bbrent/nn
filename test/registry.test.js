@@ -93,7 +93,72 @@ function run() {
     if (!(restored.players[0].gallery[0] instanceof Float32Array)) failures.push('case6: expected gallery views to deserialize as Float32Array');
   }
 
-  return { name: 'registry', total: 6, failures };
+  // Case 7: proposing a group from a couple of clear examples. Registering a
+  // player should not mean sorting every thumbnail by hand — the person picks
+  // the pictures that actually show the bowl and the rest are matched against
+  // those.
+  {
+    // Two bowl sets, each with several views scattered a few degrees apart,
+    // and the sets far enough apart to be genuinely different-looking.
+    const setA = [0, 6, -8, 14].map(unitVectorAtAngle);
+    const setB = [70, 76, 64].map(unitVectorAtAngle);
+    const all = [...setA, ...setB];
+
+    // One clear example from set A. cos(14 deg) is about 0.97, cos(56 deg)
+    // about 0.56, so the threshold sits comfortably between them.
+    const proposal = LawnBowlsRegistry.proposeGroup(all, [setA[0]]);
+    const chosen = proposal.map(p => p.proposed);
+
+    if (!chosen.slice(0, 4).every(Boolean)) {
+      failures.push(`case7: one clear example should propose its whole set, got ${JSON.stringify(chosen)}`);
+    }
+    if (chosen.slice(4).some(Boolean)) {
+      failures.push(`case7: the other player's bowls should not be proposed, got ${JSON.stringify(chosen)}`);
+    }
+    if (proposal.some(p => typeof p.similarity !== 'number')) {
+      failures.push('case7: every candidate should report its similarity so a borderline one can be judged');
+    }
+    // The example itself scores 1 against itself.
+    if (!approxEqual(proposal[0].similarity, 1, 1e-6)) {
+      failures.push(`case7: the example should score 1 against itself, got ${proposal[0].similarity}`);
+    }
+  }
+
+  // Case 8: more examples reach further, and similarity is against the best
+  // of them rather than their average. A bowl seen in sun and in shade gives
+  // two genuinely different embeddings; averaging them lands between the two
+  // and matches neither.
+  {
+    const near = unitVectorAtAngle(0);
+    const far = unitVectorAtAngle(60);
+    const between = unitVectorAtAngle(30); // 30 deg from both, 0.87 either way
+
+    const oneExample = LawnBowlsRegistry.proposeGroup([far], [near]);
+    if (oneExample[0].proposed) {
+      failures.push('case8: 60 degrees away should not be proposed from a single near example');
+    }
+
+    const twoExamples = LawnBowlsRegistry.proposeGroup([between], [near, far]);
+    if (!twoExamples[0].proposed) {
+      failures.push('case8: a view between two examples should be proposed');
+    }
+    if (!approxEqual(twoExamples[0].similarity, Math.cos(30 * Math.PI / 180), 1e-6)) {
+      failures.push(`case8: similarity should be to the nearest example (0.866), got ${twoExamples[0].similarity}`);
+    }
+  }
+
+  // Case 9: with nothing picked yet there is nothing to propose, and asking
+  // must not crash or silently select everything.
+  {
+    const proposal = LawnBowlsRegistry.proposeGroup([unitVectorAtAngle(0), unitVectorAtAngle(45)], []);
+    if (proposal.length !== 2) failures.push('case9: should return one entry per candidate');
+    if (proposal.some(p => p.proposed)) failures.push('case9: nothing should be proposed with no examples picked');
+    if (proposal.some(p => p.similarity !== null)) {
+      failures.push('case9: similarity should be null rather than a made-up number');
+    }
+  }
+
+  return { name: 'registry', total: 9, failures };
 }
 
 module.exports = { run };

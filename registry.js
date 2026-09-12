@@ -73,6 +73,40 @@
     return { playerId: best.id, name: best.name, team: best.team, similarity: bestSim };
   }
 
+  // Given a few pictures picked out as clear examples of somebody's bowl,
+  // works out which of the rest are the same bowl set.
+  //
+  // This is what makes registering a player bearable. Sorting through every
+  // thumbnail by hand is tedious and the pictures are not equally useful —
+  // most are half-shadowed, motion-blurred or caught at an angle, and the
+  // person can see at a glance which one or two actually show the bowl
+  // properly. Those are the ones worth their attention; matching the rest
+  // against them is exactly what the appearance embeddings are for.
+  //
+  // Similarity is taken against the best of the chosen examples rather than
+  // their average, for the same reason the registry itself keeps a gallery: a
+  // bowl photographed in shade and in sun gives two genuinely different
+  // embeddings, and averaging them lands between the two and matches neither.
+  //
+  // Returns one entry per candidate, in the order given, so callers can show
+  // the score alongside each picture rather than only a verdict — with a
+  // handful of examples the person is far better placed to judge a borderline
+  // one than any threshold is.
+  function proposeGroup(embeddings, seedEmbeddings, threshold) {
+    if (threshold === undefined) threshold = DEFAULT_MATCH_THRESHOLD;
+    return embeddings.map(embedding => {
+      let best = -1;
+      for (const seed of seedEmbeddings) {
+        const similarity = cosineSimilarity(embedding, seed);
+        if (similarity > best) best = similarity;
+      }
+      return {
+        similarity: seedEmbeddings.length ? best : null,
+        proposed: seedEmbeddings.length > 0 && best >= threshold,
+      };
+    });
+  }
+
   // localStorage-friendly (de)serialization — embeddings become plain arrays.
   function serialize(registry) {
     return JSON.stringify({
@@ -104,6 +138,7 @@
     removePlayer,
     addGalleryView,
     matchBowl,
+    proposeGroup,
     serialize,
     deserialize,
   };
