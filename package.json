@@ -8,7 +8,8 @@
     "generate-fixtures": "node test/generate-fixtures.js",
     "generate-fixtures:three": "node test/generate-three-fixtures.js",
     "scan": "node test/scan-harness.js",
-    "real-scan": "node test/real-scan.js"
+    "real-scan": "node test/real-scan.js",
+    "delivery-probe": "node test/delivery-probe.js"
   },
   "repository": {
     "type": "git",
