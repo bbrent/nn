@@ -488,7 +488,8 @@
     // itself. Handing it back lets a frame showing only two or three bowls be
     // used instead of refused, which is most of what made the map slow to
     // fill in.
-    const local = toLocalFrame(detections, frame.jack, frame.width, frame.height, frame.focalLength, slam.groundNormal);
+    const local = toLocalFrame(detections, frame.jack, frame.width, frame.height,
+      frame.focalLength, slam.groundNormal);
     if (!local.ok) {
       return { merged: false, reason: local.reason };
     }

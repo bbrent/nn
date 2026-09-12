@@ -173,6 +173,34 @@ async function main() {
       console.log('  ' + summarise('centre error (bowl radii)', allCentres));
     }
 
+    // Which shape does the detector's radius error take? If its box runs large
+    // by a fixed number of pixels, the excess is constant and hurts small far
+    // bowls most; if it runs large by a percentage, the ratio is constant and
+    // it is a harmless uniform scale. The two call for completely different
+    // corrections, so it is worth knowing which.
+    const pairs = result.frames.flatMap(f => f.radiusPairs || []);
+    if (pairs.length > 4) {
+      const buckets = [[0, 8], [8, 14], [14, 22], [22, 100]];
+      console.log('\nShape of the detector\'s radius error:');
+      console.log('  true radius    n    excess px   excess %');
+      for (const [lo, hi] of buckets) {
+        const inBucket = pairs.filter(p => p[0] >= lo && p[0] < hi);
+        if (!inBucket.length) continue;
+        const excessPx = inBucket.reduce((s, p) => s + (p[1] - p[0]), 0) / inBucket.length;
+        const excessPct = inBucket.reduce((s, p) => s + (p[1] / p[0] - 1), 0) / inBucket.length * 100;
+        console.log('  ' + (lo + '-' + hi + 'px').padEnd(13) + String(inBucket.length).padStart(3) +
+          '     ' + excessPx.toFixed(2).padStart(6) + '     ' + excessPct.toFixed(1).padStart(6) + '%');
+      }
+    }
+
+    const tiltErrors = result.frames.map(f => f.tiltErrorDeg).filter(v => v !== null && isFinite(v));
+    if (tiltErrors.length) {
+      const sorted = tiltErrors.slice().sort((a, b) => a - b);
+      console.log(`\nGreen tilt: fitted from the bowls vs what gravity would report (${tiltErrors.length} frames)`);
+      console.log(`  median ${sorted[Math.floor(sorted.length / 2)].toFixed(2)} degrees off, ` +
+        `worst ${sorted[sorted.length - 1].toFixed(2)}`);
+    }
+
     const totalVisible = result.frames.reduce((s, f) => s + f.visible, 0);
     const totalFound = result.frames.reduce((s, f) => s + f.found, 0);
     const totalSpurious = result.frames.reduce((s, f) => s + f.spurious, 0);

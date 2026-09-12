@@ -152,6 +152,7 @@ function scoreDetections(detections, truth) {
   // wrong — and being consistent, it is invisible to the spread between
   // frames that the reported uncertainty is built from.
   const radiusRatios = [];
+  const radiusPairs = [];
   const centreErrors = [];
   for (const t of visible) {
     let best = -1;
@@ -165,13 +166,25 @@ function scoreDetections(detections, truth) {
       claimed.add(best);
       hits++;
       radiusRatios.push(detections[best].r / t.r);
+      radiusPairs.push([t.r, detections[best].r]);
       centreErrors.push(bestDist / t.r);
     }
   }
   return {
     visible: visible.length, found: hits, spurious: detections.length - claimed.size,
-    radiusRatios, centreErrors,
+    radiusRatios, radiusPairs, centreErrors,
   };
+}
+
+// The green's tilt as the phone's accelerometer would report it. World up is
+// (0,1,0); gravity is the opposite of it, and a still phone measures exactly
+// that. Rotated into the camera's own axes, and flipped from three.js's
+// convention (y up, looking down -z) into the one ground.js uses (y down, z
+// forward into the scene).
+function trueGroundNormal() {
+  const up = new THREE.Vector3(0, 1, 0)
+    .applyQuaternion(state.camera.quaternion.clone().invert());
+  return { x: up.x, y: -up.y, z: -up.z };
 }
 
 window.runScan = async function (path) {
@@ -195,6 +208,19 @@ window.runScan = async function (path) {
     const result = await LawnBowlsYolo.detectAndRank(ort, session, imageData, box);
     const detectionQuality = scoreDetections(result.detections, truth);
 
+    // How far the tilt worked out from the bowls differs from the tilt gravity
+    // would hand over. This is the number that decides whether reading the
+    // accelerometer is worth anything at all.
+    const fitted = LawnBowlsGround.rectify(result.detections, result.usable ? result.jack : null,
+      { width: config.width, height: config.height });
+    let tiltErrorDeg = null;
+    if (fitted.ok && fitted.normal) {
+      const t = trueGroundNormal();
+      let dot = fitted.normal.x * t.x + fitted.normal.y * t.y + fitted.normal.z * t.z;
+      dot = Math.max(-1, Math.min(1, Math.abs(dot))); // sign convention aside
+      tiltErrorDeg = Math.acos(dot) * 180 / Math.PI;
+    }
+
     const merged = LawnBowlsSlam.addFrame(slam, {
       detections: result.detections,
       jack: result.usable ? result.jack : null,
@@ -207,6 +233,7 @@ window.runScan = async function (path) {
       jackFound: !!result.jack,
       classifierUsable: result.usable,
       classifierReason: result.reason,
+      tiltErrorDeg,
       merged: merged.merged,
       mergeReason: merged.reason,
       relocalised: !!merged.relocalised,
